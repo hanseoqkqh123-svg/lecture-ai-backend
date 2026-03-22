@@ -8,11 +8,31 @@ require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://lecture-ai-ujen.vercel.app",
+];
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+
+  if (allowedOrigins.includes(origin)) return true;
+
+  if (/^https:\/\/lecture-ai-ujen-.*\.vercel\.app$/.test(origin)) return true;
+
+  return false;
+}
 
 app.use(
   cors({
-    origin: FRONTEND_URL,
+    origin: function (origin, callback) {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("CORS 차단: " + origin));
+      }
+    },
     methods: ["GET", "POST"],
     credentials: true,
   })
@@ -24,7 +44,13 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: FRONTEND_URL,
+    origin: function (origin, callback) {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Socket CORS 차단: " + origin));
+      }
+    },
     methods: ["GET", "POST"],
     credentials: true,
   },
