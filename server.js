@@ -20,9 +20,9 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 const allowedOrigins = [
-    "http://localhost:3000",
-    "https://lecture-ai-ujen.vercel.app",
-];
+  "http://localhost:3000",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
 
 function isAllowedOrigin(origin) {
     if (!origin) return true;
@@ -275,25 +275,35 @@ app.get("/api/quiz-history/:userId", (req, res) => {
 
 // 강의 삭제
 app.delete("/api/lectures/:lectureId", (req, res) => {
-    const lectureId = req.params.lectureId;
-    const { user_id } = req.body;
+  const lectureId = req.params.lectureId;
+  const { user_id } = req.body;
 
-    if (!user_id) {
-        return res.status(400).json({ message: "user_id가 필요합니다." });
+  if (!user_id) {
+    return res.status(400).json({ message: "user_id가 필요합니다." });
+  }
+
+  const deleteQuizHistorySql = `DELETE FROM quiz_history WHERE lecture_id = ? AND user_id = ?`;
+  const deleteLectureSql = `DELETE FROM lectures WHERE lecture_id = ? AND user_id = ?`;
+
+  db.query(deleteQuizHistorySql, [lectureId, user_id], (quizErr) => {
+    if (quizErr) {
+      console.error("퀴즈 히스토리 삭제 오류:", quizErr);
+      return res.status(500).json({ message: "연결된 퀴즈 기록 삭제 실패" });
     }
 
-    const sql = `DELETE FROM lectures WHERE id = ? AND user_id = ?`;
+    db.query(deleteLectureSql, [lectureId, user_id], (err, result) => {
+      if (err) {
+        console.error("강의 삭제 오류:", err);
+        return res.status(500).json({ message: "강의 삭제 실패" });
+      }
 
-    db.query(sql, [lectureId, user_id], (err, result) => {
-        if (err) {
-            console.error("강의 삭제 오류:", err);
-            return res.status(500).json({ message: "강의 삭제 실패" });
-        }
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
-        }
-        return res.status(200).json({ message: "강의가 삭제되었습니다." });
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
+      }
+
+      return res.status(200).json({ message: "강의가 삭제되었습니다." });
     });
+  });
 });
 
 // 내 강의 목록 조회
@@ -492,3 +502,4 @@ ${text.slice(0, 8000)}
 server.listen(PORT, () => {
     console.log(`✅ 서버 실행 중: ${PORT}`);
 });
+
