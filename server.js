@@ -8,22 +8,18 @@ const multer = require("multer");
 const fs = require("fs");
 const FormData = require("form-data");
 const fetch = require("node-fetch");
-const { execSync } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
+const { execSync } = require("child_process");
 require("dotenv").config();
 
 if (!fs.existsSync("uploads_tmp/")) fs.mkdirSync("uploads_tmp/");
-
 const upload = multer({ dest: "uploads_tmp/" });
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// 접속 중 멤버 관리
-const roomMembers = {};
-
 const allowedOrigins = [
   "http://localhost:3000",
-  "https://lecture-ai-ujen.vercel.app",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
@@ -36,12 +32,9 @@ function isAllowedOrigin(origin) {
 
 app.use(
   cors({
-    origin: function (origin, callback) {
-      if (isAllowedOrigin(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("CORS 차단: " + origin));
-      }
+    origin(origin, callback) {
+      if (isAllowedOrigin(origin)) callback(null, true);
+      else callback(new Error("CORS 차단: " + origin));
     },
     methods: ["GET", "POST", "DELETE", "PUT", "PATCH"],
     credentials: true,
@@ -54,12 +47,9 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: function (origin, callback) {
-      if (isAllowedOrigin(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Socket CORS 차단: " + origin));
-      }
+    origin(origin, callback) {
+      if (isAllowedOrigin(origin)) callback(null, true);
+      else callback(new Error("Socket CORS 차단: " + origin));
     },
     methods: ["GET", "POST", "DELETE", "PUT", "PATCH"],
     credentials: true,
@@ -69,58 +59,124 @@ const io = new Server(server, {
 io.on("connection", (socket) => {
   console.log("새 소켓 연결:", socket.id);
 
-  socket.on("join_room", (data) => {
-    if (!data?.roomId) return;
-
-    const roomId = String(data.roomId);
-    const memberName = String(
-      data.name || data.email || data.user_id || "익명"
-    );
-
-    socket.join(roomId);
-    socket.data.roomId = roomId;
-    socket.data.memberName = memberName;
-
-    if (!roomMembers[roomId]) roomMembers[roomId] = new Set();
-    roomMembers[roomId].add(memberName);
-
-    io.to(roomId).emit("online_members", {
-      members: Array.from(roomMembers[roomId]),
-    });
-
-    console.log(`${memberName} joined room ${roomId}`);
+  socket.on("join_self", (userId) => {
+    if (!userId) return;
+    socket.join(`user_${userId}`);
   });
 
-  socket.on("typing", ({ roomId, sender }) => {
-    if (!roomId || !sender) return;
-    socket.to(String(roomId)).emit("typing", { sender });
+  socket.on("join_room", (roomId) => {
+    if (!roomId) return;
+    socket.join(String(roomId));
   });
 
   socket.on("send_message", (data) => {
-    console.log("받은 메시지:", data);
-    if (data?.roomId) {
-      io.to(String(data.roomId)).emit("receive_message", data);
-    } else {
-      socket.broadcast.emit("receive_message", data);
+    const roomId = String(data.roomId || "").trim();
+    const sender_id = data.sender_id;
+    const sender_name = data.sender_name || "익명";
+    const text = String(data.text || "").trim();
+    const client_temp_id = data.client_temp_id || null;
+
+    if (!roomId || !sender_id || !text) return;
+
+    const saveMessage = () => {
+      const sql =
+        "INSERT INTO chat_messages (room_id, sender_id, sender_name, message, client_temp_id) VALUES (?, ?, ?, ?, ?)";
+
+      db.query(
+        sql,
+        [roomId, sender_id, sender_name, text, client_temp_id],
+        (err, result) => {
+          if (err) {
+            console.error("메시지 저장 실패:", err);
+            return;
+          }
+
+          const messageData = {
+            id: result.insertId,
+            roomId,
+            room_id: roomId,
+            sender_id,
+            sender_name,
+            text,
+            message: text,
+            client_temp_id,
+            created_at: new Date().toISOString(),
+          };
+
+          io.to(roomId).emit("receive_message", messageData);
+
+          if (roomId.startsWith("private_")) {
+            const [, firstId, secondId] = roomId.split("_");
+            const targetId =
+              String(firstId) === String(sender_id)
+                ? String(secondId)
+                : String(firstId);
+
+            io.to(`user_${targetId}`).emit("receive_message", messageData);
+          }
+        }
+      );
+    };
+
+    if (roomId === "team-room") {
+      db.query(
+        "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
+        [roomId, "전체 팀 채팅방"],
+        (roomErr) => {
+          if (roomErr) {
+            console.error("team-room 생성 실패:", roomErr);
+            return;
+          }
+
+          saveMessage();
+        }
+      );
+      return;
     }
+
+    if (roomId.startsWith("private_")) {
+      const [, userA, userB] = roomId.split("_");
+
+      db.query(
+        "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, false)",
+        [roomId, "개인 채팅"],
+        (roomErr) => {
+          if (roomErr) {
+            console.error("개인 채팅방 생성 실패:", roomErr);
+            return;
+          }
+
+          const memberValues = [
+            [roomId, userA],
+            [roomId, userB],
+          ];
+
+          db.query(
+            "INSERT IGNORE INTO room_members (room_id, user_id) VALUES ?",
+            [memberValues],
+            (memberErr) => {
+              if (memberErr) {
+                console.error("개인 채팅 멤버 등록 실패:", memberErr);
+                return;
+              }
+
+              saveMessage();
+            }
+          );
+        }
+      );
+      return;
+    }
+
+    saveMessage();
+  });
+
+  socket.on("send_notification", (data) => {
+    if (!data?.targetId) return;
+    io.to(`user_${data.targetId}`).emit("new_notification", data);
   });
 
   socket.on("disconnect", () => {
-    const roomId = socket.data.roomId;
-    const memberName = socket.data.memberName;
-
-    if (roomId && memberName && roomMembers[roomId]) {
-      roomMembers[roomId].delete(memberName);
-
-      io.to(roomId).emit("online_members", {
-        members: Array.from(roomMembers[roomId]),
-      });
-
-      if (roomMembers[roomId].size === 0) {
-        delete roomMembers[roomId];
-      }
-    }
-
     console.log("소켓 연결 종료:", socket.id);
   });
 });
@@ -197,6 +253,317 @@ app.post("/api/login", (req, res) => {
   });
 });
 
+// 친구 요청
+app.post("/api/friends/request", (req, res) => {
+  const { userId, friendEmail, senderName } = req.body;
+
+  if (!userId || !friendEmail || !friendEmail.trim()) {
+    return res.status(400).json({ message: "userId와 friendEmail이 필요합니다." });
+  }
+
+  db.query(
+    "SELECT user_id, name, email FROM users WHERE email = ?",
+    [friendEmail.trim()],
+    (err, results) => {
+      if (err) return res.status(500).json({ message: "DB 에러" });
+      if (results.length === 0) {
+        return res.status(404).json({ message: "사용자를 찾을 수 없습니다." });
+      }
+
+      const targetUser = results[0];
+      const friendId = targetUser.user_id;
+
+      if (String(userId) === String(friendId)) {
+        return res.status(400).json({ message: "본인은 추가할 수 없습니다." });
+      }
+
+      const checkSql = `
+        SELECT user_id, friend_id, status
+        FROM friends
+        WHERE (user_id = ? AND friend_id = ?)
+           OR (user_id = ? AND friend_id = ?)
+      `;
+
+      db.query(checkSql, [userId, friendId, friendId, userId], (checkErr, rows) => {
+        if (checkErr) {
+          console.error("친구 관계 확인 실패:", checkErr);
+          return res.status(500).json({ message: "친구 요청 확인 실패" });
+        }
+
+        const alreadyFriend = rows.find((row) => row.status === "accepted");
+        if (alreadyFriend) {
+          return res.status(409).json({ message: "이미 친구입니다." });
+        }
+
+        const alreadySent = rows.find(
+          (row) =>
+            String(row.user_id) === String(userId) &&
+            String(row.friend_id) === String(friendId) &&
+            row.status === "pending"
+        );
+        if (alreadySent) {
+          return res.status(409).json({ message: "이미 친구 요청을 보냈습니다." });
+        }
+
+        const incomingPending = rows.find(
+          (row) =>
+            String(row.user_id) === String(friendId) &&
+            String(row.friend_id) === String(userId) &&
+            row.status === "pending"
+        );
+        if (incomingPending) {
+          return res.status(409).json({
+            message: "상대가 먼저 친구 요청을 보냈습니다. 받은 요청에서 수락해주세요.",
+          });
+        }
+
+        db.query(
+          "INSERT INTO friends (user_id, friend_id, status) VALUES (?, ?, 'pending')",
+          [userId, friendId],
+          (insertErr) => {
+            if (insertErr) {
+              console.error("친구 요청 저장 실패:", insertErr);
+              return res.status(500).json({ message: "친구 요청 실패" });
+            }
+
+            io.to(`user_${friendId}`).emit("new_notification", {
+              type: "friend_request",
+              targetId: friendId,
+              requesterId: userId,
+              message: `${senderName || "누군가"}님이 친구 요청을 보냈습니다.`,
+            });
+
+            return res.status(200).json({
+              message: "친구 요청을 보냈습니다.",
+              friendId,
+              friendName: targetUser.name,
+            });
+          }
+        );
+      });
+    }
+  );
+});
+
+// 받은 친구 요청 목록
+app.get("/api/friends/requests/:userId", (req, res) => {
+  const userId = req.params.userId;
+
+  const sql = `
+    SELECT u.user_id, u.name, u.email
+    FROM friends f
+    JOIN users u ON u.user_id = f.user_id
+    WHERE f.friend_id = ?
+      AND f.status = 'pending'
+    ORDER BY u.name ASC
+  `;
+
+  db.query(sql, [userId], (err, results) => {
+    if (err) {
+      console.error("받은 친구 요청 조회 실패:", err);
+      return res.status(500).json({ message: "받은 친구 요청 조회 실패" });
+    }
+    return res.status(200).json(results);
+  });
+});
+
+// 보낸 친구 요청 목록
+app.get("/api/friends/requests/sent/:userId", (req, res) => {
+  const userId = req.params.userId;
+
+  const sql = `
+    SELECT u.user_id, u.name, u.email
+    FROM friends f
+    JOIN users u ON u.user_id = f.friend_id
+    WHERE f.user_id = ?
+      AND f.status = 'pending'
+    ORDER BY u.name ASC
+  `;
+
+  db.query(sql, [userId], (err, results) => {
+    if (err) {
+      console.error("보낸 친구 요청 조회 실패:", err);
+      return res.status(500).json({ message: "보낸 친구 요청 조회 실패" });
+    }
+    return res.status(200).json(results);
+  });
+});
+
+// 친구 요청 수락/거절
+app.patch("/api/friends/request/respond", (req, res) => {
+  const { userId, requesterId, responderName, action } = req.body;
+
+  if (!userId || !requesterId || !["accepted", "rejected"].includes(action)) {
+    return res.status(400).json({ message: "필수값이 누락되었거나 action이 올바르지 않습니다." });
+  }
+
+  db.query(
+    "SELECT * FROM friends WHERE user_id = ? AND friend_id = ? AND status = 'pending'",
+    [requesterId, userId],
+    (checkErr, rows) => {
+      if (checkErr) {
+        console.error("친구 요청 확인 실패:", checkErr);
+        return res.status(500).json({ message: "친구 요청 확인 실패" });
+      }
+
+      if (rows.length === 0) {
+        return res.status(404).json({ message: "처리할 친구 요청이 없습니다." });
+      }
+
+      if (action === "accepted") {
+        db.query(
+          "UPDATE friends SET status = 'accepted' WHERE user_id = ? AND friend_id = ? AND status = 'pending'",
+          [requesterId, userId],
+          (updateErr) => {
+            if (updateErr) {
+              console.error("친구 요청 수락 실패:", updateErr);
+              return res.status(500).json({ message: "친구 요청 수락 실패" });
+            }
+
+            io.to(`user_${requesterId}`).emit("new_notification", {
+              type: "friend_accepted",
+              targetId: requesterId,
+              responderId: userId,
+              message: `${responderName || "상대"}님이 친구 요청을 수락했습니다.`,
+            });
+
+            return res.status(200).json({ message: "친구 요청을 수락했습니다." });
+          }
+        );
+      } else {
+        db.query(
+          "DELETE FROM friends WHERE user_id = ? AND friend_id = ? AND status = 'pending'",
+          [requesterId, userId],
+          (deleteErr) => {
+            if (deleteErr) {
+              console.error("친구 요청 거절 실패:", deleteErr);
+              return res.status(500).json({ message: "친구 요청 거절 실패" });
+            }
+
+            io.to(`user_${requesterId}`).emit("new_notification", {
+              type: "friend_rejected",
+              targetId: requesterId,
+              responderId: userId,
+              message: `${responderName || "상대"}님이 친구 요청을 거절했습니다.`,
+            });
+
+            return res.status(200).json({ message: "친구 요청을 거절했습니다." });
+          }
+        );
+      }
+    }
+  );
+});
+
+// 친구 목록
+app.get("/api/friends/:userId", (req, res) => {
+  const userId = req.params.userId;
+
+  const sql = `
+    SELECT DISTINCT u.user_id, u.name, u.email
+    FROM users u
+    JOIN friends f ON (u.user_id = f.friend_id OR u.user_id = f.user_id)
+    WHERE (f.user_id = ? OR f.friend_id = ?)
+      AND u.user_id != ?
+      AND f.status = 'accepted'
+  `;
+
+  db.query(sql, [userId, userId, userId], (err, results) => {
+    if (err) {
+      console.error("친구 목록 조회 실패:", err);
+      return res.status(500).json({ message: "친구 목록 조회 실패" });
+    }
+    return res.status(200).json(results);
+  });
+});
+
+// 단체 채팅방 생성
+app.post("/api/chat/rooms", (req, res) => {
+  const { roomName, members } = req.body;
+
+  if (!members || members.length === 0) {
+    return res.status(400).json({ message: "멤버가 없습니다." });
+  }
+
+  const roomId = `group_${Date.now()}`;
+
+  db.query(
+    "INSERT INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
+    [roomId, roomName],
+    (err) => {
+      if (err) {
+        console.error("방 생성 DB 에러:", err);
+        return res.status(500).json({ message: "방 생성 실패" });
+      }
+
+      const values = members.map((id) => [roomId, id]);
+
+      db.query(
+        "INSERT INTO room_members (room_id, user_id) VALUES ?",
+        [values],
+        (memberErr) => {
+          if (memberErr) {
+            console.error("멤버 등록 DB 에러:", memberErr);
+            return res.status(500).json({ message: "멤버 초대 실패" });
+          }
+          return res.status(201).json({ roomId, roomName });
+        }
+      );
+    }
+  );
+});
+
+// 내가 속한 단체방 목록
+app.get("/api/chat/rooms/:userId", (req, res) => {
+  const userId = req.params.userId;
+
+  const sql = `
+    SELECT DISTINCT
+      cr.room_id,
+      cr.room_name,
+      cr.is_group
+    FROM chat_rooms cr
+    JOIN room_members rm ON cr.room_id = rm.room_id
+    WHERE rm.user_id = ?
+      AND cr.room_id LIKE 'group_%'
+    ORDER BY cr.room_id DESC
+  `;
+
+  db.query(sql, [userId], (err, results) => {
+    if (err) {
+      console.error("채팅방 목록 조회 실패:", err);
+      return res.status(500).json({ message: "채팅방 목록 조회 실패" });
+    }
+
+    return res.status(200).json(results);
+  });
+});
+
+// 채팅 내역 조회
+app.get("/api/chat/messages/:roomId", (req, res) => {
+  const sql = `
+    SELECT
+      id,
+      room_id AS roomId,
+      sender_id,
+      sender_name,
+      message AS text,
+      created_at,
+      client_temp_id
+    FROM chat_messages
+    WHERE room_id = ?
+    ORDER BY created_at ASC
+  `;
+
+  db.query(sql, [req.params.roomId], (err, results) => {
+    if (err) {
+      console.error("메시지 조회 실패:", err);
+      return res.status(500).json({ message: "메시지 조회 실패" });
+    }
+    return res.status(200).json(results);
+  });
+});
+
 // 강의 저장
 app.post("/api/lectures", (req, res) => {
   const { user_id, title, raw_text, summary_data } = req.body;
@@ -232,7 +599,11 @@ app.put("/api/lectures/:lectureId", (req, res) => {
     return res.status(400).json({ message: "필수값이 누락되었습니다." });
   }
 
-  const sql = `UPDATE lectures SET title = ?, raw_text = ?, summary_data = ? WHERE lecture_id = ? AND user_id = ?`;
+  const sql = `
+  UPDATE lectures
+  SET title = ?, raw_text = ?, summary_data = ?
+  WHERE id = ? AND user_id = ?
+`;
 
   db.query(
     sql,
@@ -262,7 +633,11 @@ app.post("/api/quiz-history", (req, res) => {
     return res.status(400).json({ message: "강의를 먼저 저장한 후 퀴즈를 제출해주세요." });
   }
 
-  const sql = `INSERT INTO quiz_history (user_id, lecture_id, lecture_title, score, correct, total, results) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+  const sql = `
+    INSERT INTO quiz_history
+    (user_id, lecture_id, lecture_title, score, correct, total, results)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `;
 
   db.query(
     sql,
@@ -325,7 +700,7 @@ app.delete("/api/lectures/:lectureId", (req, res) => {
   }
 
   const deleteQuizHistorySql = `DELETE FROM quiz_history WHERE lecture_id = ? AND user_id = ?`;
-  const deleteLectureSql = `DELETE FROM lectures WHERE lecture_id = ? AND user_id = ?`;
+  const deleteLectureSql = `DELETE FROM lectures WHERE id = ? AND user_id = ?`;
 
   db.query(deleteQuizHistorySql, [lectureId, user_id], (quizErr) => {
     if (quizErr) {
@@ -338,9 +713,11 @@ app.delete("/api/lectures/:lectureId", (req, res) => {
         console.error("강의 삭제 오류:", err);
         return res.status(500).json({ message: "강의 삭제 실패" });
       }
+
       if (result.affectedRows === 0) {
         return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
       }
+
       return res.status(200).json({ message: "강의가 삭제되었습니다." });
     });
   });
@@ -361,7 +738,7 @@ app.get("/api/lectures/:userId", (req, res) => {
   });
 });
 
-// STT - Whisper
+// STT
 app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "오디오 파일이 없습니다." });
@@ -455,6 +832,7 @@ app.post("/api/grade", async (req, res) => {
     if (!jsonMatch) throw new Error("JSON 파싱 실패");
 
     const parsed = JSON.parse(jsonMatch[0]);
+
     return res.status(200).json({
       isCorrect: !!parsed.isCorrect,
       feedback: parsed.feedback || "",
@@ -533,3 +911,4 @@ ${text.slice(0, 8000)}
 server.listen(PORT, () => {
   console.log(`✅ 서버 실행 중: ${PORT}`);
 });
+
