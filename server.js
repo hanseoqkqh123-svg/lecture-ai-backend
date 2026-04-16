@@ -11,17 +11,16 @@ const FormData = require("form-data");
 const fetch = require("node-fetch");
 require("dotenv").config();
 
-if (!fs.existsSync("uploads_tmp/")) fs.mkdirSync("uploads_tmp/");
+if (!fs.existsSync("uploads_tmp/")) fs.mkdirSync("uploads_tmp/", { recursive: true });
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     cb(null, "uploads_tmp/");
   },
   filename: function (req, file, cb) {
     const ext = path.extname(file.originalname) || ".webm";
-    cb(null, `${Date.now()}${ext}`);
+    cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
   },
 });
-
 const upload = multer({ storage });
 
 const app = express();
@@ -726,11 +725,70 @@ app.get("/api/lectures/:userId", (req, res) => {
     });
 });
 
+const userContextMap = new Map();
 
-// 1. 서버 파일(serverjs.txt) 상단, require 문들이 끝나는 부근에 추가
-let lastContext = ""; 
+function getUserContext(userId) {
+  return userContextMap.get(String(userId)) || "";
+}
 
-// 2. 기존 ~ 전체를 아래 코드로 통째로 교체
+function setUserContext(userId, text) {
+  const prev = getUserContext(userId);
+  const next = `${prev} ${text}`.trim().slice(-2000);
+  userContextMap.set(String(userId), next);
+}
+
+async function refineText(text) {
+  if (!text || !text.trim()) return "";
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `다음은 강의 음성인식 결과입니다.
+의미는 바꾸지 말고 표기만 교정하세요.
+
+규칙:
+- 영어 약어는 원형 유지: API, HTTP, CNN, GPT, LLM, SQL
+- 프로그래밍 언어/기술명은 표준 표기로 교정: C++, C#, JavaScript, TypeScript, Node.js, Python, Java
+- 숫자/기호/수식은 문맥상 명확하면 숫자와 기호로 교정
+- 발음대로 적힌 기술 용어를 표준 표기로 바꾸세요
+- 임의 요약, 내용 추가, 삭제 금지
+- 결과는 교정된 본문만 출력
+
+예시:
+- "파이썬" -> "Python"
+- "씨플플" -> "C++"
+- "에이피아이" -> "API"
+- "에이치티티피" -> "HTTP"
+- "에스큐엘" -> "SQL"
+- "노드 제이에스" -> "Node.js"
+- "자바 스크립트" -> "JavaScript"
+- "타입 스크립트" -> "TypeScript"`,
+        },
+        {
+          role: "user",
+          content: text,
+        },
+      ],
+      temperature: 0,
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error?.message || "전사 보정 실패");
+  }
+
+  return data.choices?.[0]?.message?.content?.trim() || text;
+}
+
 app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: "오디오 파일이 없습니다." });
@@ -743,11 +801,7 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
       throw new Error("GROQ_API_KEY가 설정되지 않았습니다.");
     }
 
-    console.log("업로드 파일명:", req.file.originalname);
-    console.log("저장 파일 경로:", req.file.path);
-    console.log("업로드 MIME:", req.file.mimetype);
-
-    if (req.file.size < 3000) {
+    if (req.file.size < 4000) {
       return res.status(200).json({ text: "" });
     }
 
@@ -762,23 +816,18 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
         ? "audio/mp4"
         : "application/octet-stream");
 
+    const userId = req.body.userId || req.query.userId || "default";
+    const prevContext = getUserContext(userId);
+
     const formData = new FormData();
     formData.append("file", fs.createReadStream(tmpPath), {
       filename: `audio${originalExt}`,
       contentType,
     });
-    formData.append("model", "whisper-large-v3");
+    formData.append("model", "whisper-large-v3-turbo");
     formData.append("language", "ko");
     formData.append("temperature", "0");
-
-    const promptContext = lastContext
-      ? `이전 강의 문맥: ${lastContext.slice(-200)}. `
-      : "";
-
-    formData.append(
-      "prompt",
-      `${promptContext}이 음성은 대학 강의 요약용 원문입니다. 한국어를 기본으로 최대한 정확하게 전사하세요. 수식, 전공 용어, 영어 약어, 코드 관련 용어는 들린 발음과 문맥에 맞게 보수적으로 유지하세요. 임의 추측이나 과도한 보정은 하지 마세요.`
-    );
+    formData.append("response_format", "verbose_json");
 
     const whisperRes = await fetch(
       "https://api.groq.com/openai/v1/audio/transcriptions",
@@ -807,13 +856,54 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
       throw new Error("Whisper 응답 파싱에 실패했습니다.");
     }
 
-    const text = String(parsed.text || "").replace(/\s+/g, " ").trim();
-
-    if (text) {
-      lastContext = `${lastContext} ${text}`.trim().slice(-2000);
+    let text = "";
+    if (Array.isArray(parsed.segments)) {
+      text = parsed.segments
+        .filter((seg) => (seg.avg_logprob ?? -1) > -0.9)
+        .map((seg) => String(seg.text || "").trim())
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    } else {
+      text = String(parsed.text || "").replace(/\s+/g, " ").trim();
     }
 
-    return res.status(200).json({ text });
+    text = text.replace(/(.{4,15}?)( \1){1,}/g, "$1");
+    text = text.replace(/(감사합니다\.?)( \1)+/g, "$1");
+    text = text.replace(/(안녕하세요\.?)( \1)+/g, "$1");
+
+    const garbagePatterns = [
+  /^안녕하세요[.! ]*$/u,
+  /^감사합니다[.! ]*$/u,
+  /^(감사합니다[.! ]*){2,}$/u,
+  /^(안녕하세요[.! ]*){2,}$/u
+];
+
+if (garbagePatterns.some((p) => p.test(text))) {
+  text = "";
+}
+
+const bannedPhrases = [
+  "한국어 강의를 정확히 전사하세요.",
+  "이 음성은 학교 강의입니다. 한국어로 정확하게 전사하세요. 수식, 전공 용어, 영어 약어(예: CNN, HTTP, API)는 들린 그대로 유지하세요. 문장이 자연스럽게 이어지도록 하되 내용을 임의로 추가하거나 요약하지 마세요."
+];
+
+if (bannedPhrases.some((phrase) => text.includes(phrase))) {
+  text = "";
+}
+
+// 이거 있으니까 계속 이상한말 반복하길래 일단 주석처리함
+// if (text) {
+//  text = await refineText(text);
+//}
+
+// 마지막에 사용자 문맥 저장 인데 애가 계속 반복하고 이상해서 주석처리함
+//if (text) {
+//  setUserContext(userId, text);
+//}
+
+return res.status(200).json({ text });
   } catch (error) {
     console.error("/api/transcribe 오류:", error);
     return res.status(500).json({
@@ -821,7 +911,7 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
     });
   } finally {
     try {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      if (tmpPath && fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
     } catch (e) {
       console.error("tmp 파일 삭제 실패:", e);
     }
