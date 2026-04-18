@@ -9,27 +9,70 @@ const fs = require("fs");
 const path = require("path");
 const FormData = require("form-data");
 const fetch = require("node-fetch");
+const { execFile } = require("child_process");
+const jwt = require("jsonwebtoken");
+const ffmpeg = require("fluent-ffmpeg"); // npm install fluent-ffmpeg
+const ffmpegPath = require("ffmpeg-static"); //npm install fluent-ffmpeg ffmpeg-static
+ffmpeg.setFfmpegPath(ffmpegPath);
+
 require("dotenv").config();
 
 if (!fs.existsSync("uploads_tmp/")) fs.mkdirSync("uploads_tmp/", { recursive: true });
 const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, "uploads_tmp/");
-  },
-  filename: function (req, file, cb) {
-    const ext = path.extname(file.originalname) || ".webm";
-    cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
-  },
+    destination: function (req, file, cb) {
+        cb(null, "uploads_tmp/");
+    },
+    filename: function (req, file, cb) {
+        const ext = path.extname(file.originalname) || ".webm";
+        cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+    },
 });
 const upload = multer({ storage });
+
+function convertToWav(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .audioChannels(1)
+            .audioFrequency(16000)
+            .format("wav")
+            .on("end", () => resolve(outputPath))
+            .on("error", (err) => reject(err))
+            .save(outputPath);
+    });
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 const allowedOrigins = [
-  "http://localhost:3000",
-  process.env.FRONTEND_URL,
+    "http://localhost:3000",
+    process.env.FRONTEND_URL,
 ].filter(Boolean);
+
+function createToken(user) {
+    return jwt.sign(
+        user,
+        process.env.JWT_SECRET || "secret",
+        { expiresIn: "7d" }
+    );
+}
+
+function requireAuth(req, res, next) {
+    const auth = req.headers.authorization || "";
+    const token = auth.split(" ")[1];
+
+    if (!token) {
+        return res.status(401).json({ message: "인증 필요" });
+    }
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        req.user = decoded;
+        next();
+    } catch {
+        return res.status(401).json({ message: "토큰 오류" });
+    }
+}
 
 function isAllowedOrigin(origin) {
     if (!origin) return true;
@@ -70,123 +113,202 @@ const io = new Server(server, {
     },
 });
 
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+
+    if (!token) {
+      return next(new Error("인증 필요"));
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+    socket.user = decoded;
+    next();
+  } catch (err) {
+    return next(new Error("토큰 오류"));
+  }
+});
+
 io.on("connection", (socket) => {
-    console.log("새 소켓 연결:", socket.id);
+  console.log("새 소켓 연결:", socket.id, "user:", socket.user?.user_id);
 
-    // 사용자의 고유 ID 방에 접속 (개인 알림용)
-    socket.on("join_self", (userId) => {
-        socket.join(`user_${userId}`);
-    });
+  // 인증된 자기 방만 입장
+  socket.join(`user_${socket.user.user_id}`);
 
-    socket.on("join_room",(roomId)=>{
-        socket.join(String(roomId));
-    });
+  socket.on("join_self", () => {
+    socket.join(`user_${socket.user.user_id}`);
+  });
 
-    socket.on("send_message", (data) => {
+  socket.on("join_room", (roomId) => {
+    const safeRoomId = String(roomId || "").trim();
+    if (!safeRoomId) return;
+
+    // team-room은 허용
+    if (safeRoomId === "team-room") {
+      socket.join("team-room");
+      return;
+    }
+
+    // private_방은 본인 포함일 때만 허용
+    if (safeRoomId.startsWith("private_")) {
+      const [, a, b] = safeRoomId.split("_");
+      const me = String(socket.user.user_id);
+
+      if (me !== String(a) && me !== String(b)) {
+        return;
+      }
+
+      socket.join(safeRoomId);
+      return;
+    }
+
+    // group_방은 DB 멤버일 때만 허용
+    if (safeRoomId.startsWith("group_")) {
+      db.query(
+        "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? LIMIT 1",
+        [safeRoomId, socket.user.user_id],
+        (err, rows) => {
+          if (err) {
+            console.error("채팅방 권한 확인 실패:", err);
+            return;
+          }
+          if (rows.length > 0) {
+            socket.join(safeRoomId);
+          }
+        }
+      );
+    }
+  });
+
+  socket.on("send_message", (data) => {
     const roomId = String(data.roomId || "").trim();
-    const sender_id = data.sender_id;
-    const sender_name = data.sender_name || "익명";
+    const sender_id = socket.user.user_id;
+    const sender_name = socket.user.name || "익명";
     const text = String(data.text || "").trim();
     const client_temp_id = data.client_temp_id || null;
 
-    if (!roomId || !sender_id || !text) return;
+    if (!roomId || !text) return;
 
     const saveMessage = () => {
-        const sql = "INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES (?, ?, ?, ?)";
+      const sql =
+        "INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES (?, ?, ?, ?)";
 
-        db.query(sql, [roomId, sender_id, sender_name, text], (err, result) => {
-            if (err) {
-                console.error("메시지 저장 실패:", err);
-                return;
-            }
+      db.query(sql, [roomId, sender_id, sender_name, text], (err, result) => {
+        if (err) {
+          console.error("메시지 저장 실패:", err);
+          return;
+        }
 
-            const messageData = {
-                id: result.insertId,
-                roomId,
-                room_id: roomId,
-                sender_id,
-                sender_name,
-                text,
-                message: text,
-                client_temp_id,
-                created_at: new Date().toISOString(),
-            };
+        const messageData = {
+          id: result.insertId,
+          roomId,
+          room_id: roomId,
+          sender_id,
+          sender_name,
+          text,
+          message: text,
+          client_temp_id,
+          created_at: new Date().toISOString(),
+        };
 
-            io.to(roomId).emit("receive_message", messageData);
+        io.to(roomId).emit("receive_message", messageData);
 
-            if (roomId.startsWith("private_")) {
-                const [, firstId, secondId] = roomId.split("_");
-                const targetId =
-                    String(firstId) === String(sender_id)
-                        ? String(secondId)
-                        : String(firstId);
+        if (roomId.startsWith("private_")) {
+          const [, firstId, secondId] = roomId.split("_");
+          const targetId =
+            String(firstId) === String(sender_id)
+              ? String(secondId)
+              : String(firstId);
 
-                io.to(`user_${targetId}`).emit("receive_message", messageData);
-            }
-        });
+          io.to(`user_${targetId}`).emit("receive_message", messageData);
+        }
+      });
     };
 
     if (roomId === "team-room") {
-        db.query(
-            "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
-            [roomId, "전체 팀 채팅방"],
-            (roomErr) => {
-                if (roomErr) {
-                    console.error("team-room 생성 실패:", roomErr);
-                    return;
-                }
-                saveMessage();
-            }
-        );
-        return;
+      db.query(
+        "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
+        [roomId, "전체 팀 채팅방"],
+        (roomErr) => {
+          if (roomErr) {
+            console.error("team-room 생성 실패:", roomErr);
+            return;
+          }
+          saveMessage();
+        }
+      );
+      return;
     }
 
     if (roomId.startsWith("private_")) {
-        const [, userA, userB] = roomId.split("_");
+      const [, userA, userB] = roomId.split("_");
+      const me = String(sender_id);
 
-        db.query(
-            "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, false)",
-            [roomId, "개인 채팅"],
-            (roomErr) => {
-                if (roomErr) {
-                    console.error("개인 채팅방 생성 실패:", roomErr);
-                    return;
-                }
-
-                const memberValues = [
-                    [roomId, userA],
-                    [roomId, userB],
-                ];
-
-                db.query(
-                    "INSERT IGNORE INTO room_members (room_id, user_id) VALUES ?",
-                    [memberValues],
-                    (memberErr) => {
-                        if (memberErr) {
-                            console.error("개인 채팅 멤버 등록 실패:", memberErr);
-                            return;
-                        }
-
-                        saveMessage();
-                    }
-                );
-            }
-        );
+      if (me !== String(userA) && me !== String(userB)) {
         return;
+      }
+
+      db.query(
+        "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, false)",
+        [roomId, "개인 채팅"],
+        (roomErr) => {
+          if (roomErr) {
+            console.error("개인 채팅방 생성 실패:", roomErr);
+            return;
+          }
+
+          const memberValues = [
+            [roomId, userA],
+            [roomId, userB],
+          ];
+
+          db.query(
+            "INSERT IGNORE INTO room_members (room_id, user_id) VALUES ?",
+            [memberValues],
+            (memberErr) => {
+              if (memberErr) {
+                console.error("개인 채팅 멤버 등록 실패:", memberErr);
+                return;
+              }
+
+              saveMessage();
+            }
+          );
+        }
+      );
+      return;
     }
 
-    saveMessage();
-});
+    if (roomId.startsWith("group_")) {
+      db.query(
+        "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? LIMIT 1",
+        [roomId, sender_id],
+        (memberErr, rows) => {
+          if (memberErr) {
+            console.error("그룹 채팅 권한 확인 실패:", memberErr);
+            return;
+          }
+          if (rows.length === 0) return;
+          saveMessage();
+        }
+      );
+      return;
+    }
+  });
 
-    // 실시간 친구 요청/초대 알림
-    socket.on("send_notification", (data) => {
-        // data: { targetId, type, message, payload }
-        io.to(`user_${data.targetId}`).emit("new_notification", data);
-    });
+  socket.on("send_notification", (data) => {
+    const targetId = String(data.targetId || "").trim();
+    if (!targetId) return;
 
-    socket.on("disconnect", () => {
-        console.log("소켓 연결 종료:", socket.id);
+    io.to(`user_${targetId}`).emit("new_notification", {
+      ...data,
+      senderId: socket.user.user_id,
     });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("소켓 연결 종료:", socket.id);
+  });
 });
 
 app.get("/", (req, res) => {
@@ -197,8 +319,9 @@ app.get("/", (req, res) => {
 // 친구 요청 API (이메일로 친구 추가)
 // 친구 검색 및 요청
 // 친구 요청 API (수락/거절 가능한 버전)
-app.post("/api/friends/request", (req, res) => {
-    const { userId, friendEmail, senderName } = req.body;
+app.post("/api/friends/request", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const { friendEmail, senderName } = req.body;
 
     if (!userId || !friendEmail || !friendEmail.trim()) {
         return res.status(400).json({ message: "userId와 friendEmail이 필요합니다." });
@@ -289,8 +412,8 @@ app.post("/api/friends/request", (req, res) => {
 });
 
 // 받은 친구 요청 목록
-app.get("/api/friends/requests/:userId", (req, res) => {
-    const userId = req.params.userId;
+app.get("/api/friends/requests/:userId", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
 
     const sql = `
         SELECT u.user_id, u.name, u.email
@@ -311,8 +434,15 @@ app.get("/api/friends/requests/:userId", (req, res) => {
 });
 
 // 보낸 친구 요청 목록
-app.get("/api/friends/requests/sent/:userId", (req, res) => {
-    const userId = req.params.userId;
+app.get("/api/friends/requests/sent/:userId", requireAuth, (req, res) => {
+    const requestedUserId = String(req.params.userId);
+    const tokenUserId = String(req.user.user_id);
+
+    if (requestedUserId !== tokenUserId) {
+        return res.status(403).json({ message: "접근 권한이 없습니다." });
+    }
+
+    const userId = tokenUserId;
 
     const sql = `
         SELECT u.user_id, u.name, u.email
@@ -333,8 +463,9 @@ app.get("/api/friends/requests/sent/:userId", (req, res) => {
 });
 
 // 친구 요청 수락 / 거절
-app.patch("/api/friends/request/respond", (req, res) => {
-    const { userId, requesterId, responderName, action } = req.body;
+app.patch("/api/friends/request/respond", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const { requesterId, responderName, action } = req.body;
 
     if (!userId || !requesterId || !["accepted", "rejected"].includes(action)) {
         return res.status(400).json({ message: "필수값이 누락되었거나 action이 올바르지 않습니다." });
@@ -399,8 +530,8 @@ app.patch("/api/friends/request/respond", (req, res) => {
 });
 
 // 내 친구 목록 조회 API
-app.get("/api/friends/:userId", (req, res) => {
-    const userId = req.params.userId;
+app.get("/api/friends/:userId", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
     const sql = `
         SELECT DISTINCT u.user_id, u.name, u.email 
         FROM users u
@@ -416,11 +547,12 @@ app.get("/api/friends/:userId", (req, res) => {
 });
 
 // 단체 채팅방 생성 API (Internal Server Error 방지 버전)
-app.post("/api/chat/rooms", (req, res) => {
-    const { roomName, members } = req.body; 
+app.post("/api/chat/rooms", requireAuth, (req, res) => {
+    const creatorId = req.user.user_id;
+    const { roomName, members } = req.body;
     if (!members || members.length === 0) return res.status(400).json({ message: "멤버가 없습니다." });
 
-    const roomId = `group_${Date.now()}`; 
+    const roomId = `group_${Date.now()}`;
 
     // 1. 방 정보 저장
     db.query("INSERT INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)", [roomId, roomName], (err) => {
@@ -442,8 +574,15 @@ app.post("/api/chat/rooms", (req, res) => {
 });
 
 // 내가 속한 단체 채팅방 목록 조회
-app.get("/api/chat/rooms/:userId", (req, res) => {
-    const userId = req.params.userId;
+app.get("/api/chat/rooms/:userId", requireAuth, (req, res) => {
+    const requestedUserId = String(req.params.userId);
+    const tokenUserId = String(req.user.user_id);
+
+    if (requestedUserId !== tokenUserId) {
+        return res.status(403).json({ message: "접근 권한이 없습니다." });
+    }
+
+    const userId = tokenUserId;
 
     const sql = `
         SELECT DISTINCT
@@ -468,27 +607,60 @@ app.get("/api/chat/rooms/:userId", (req, res) => {
 });
 
 // 채팅 내역 조회
-app.get("/api/chat/messages/:roomId", (req, res) => {
+app.get("/api/chat/messages/:roomId", requireAuth, (req, res) => {
+  const roomId = String(req.params.roomId || "").trim();
+  const userId = req.user.user_id;
+
+  if (roomId === "team-room") {
+    return loadMessages();
+  }
+
+  if (roomId.startsWith("private_")) {
+    const [, a, b] = roomId.split("_");
+    const me = String(userId);
+    if (me !== String(a) && me !== String(b)) {
+      return res.status(403).json({ message: "접근 권한이 없습니다." });
+    }
+    return loadMessages();
+  }
+
+  db.query(
+    "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? LIMIT 1",
+    [roomId, userId],
+    (err, rows) => {
+      if (err) {
+        console.error("메시지 조회 권한 확인 실패:", err);
+        return res.status(500).json({ message: "권한 확인 실패" });
+      }
+      if (rows.length === 0) {
+        return res.status(403).json({ message: "접근 권한이 없습니다." });
+      }
+      return loadMessages();
+    }
+  );
+
+  function loadMessages() {
     const sql = `
-        SELECT
-            id,
-            room_id AS roomId,
-            sender_id,
-            sender_name,
-            message AS text,
-            created_at
-        FROM chat_messages
-        WHERE room_id = ?
-        ORDER BY created_at ASC
+      SELECT
+        id,
+        room_id AS roomId,
+        sender_id,
+        sender_name,
+        message AS text,
+        created_at
+      FROM chat_messages
+      WHERE room_id = ?
+      ORDER BY created_at ASC
     `;
 
-    db.query(sql, [req.params.roomId], (err, results) => {
-        if (err) {
-            console.error("메시지 조회 실패:", err);
-            return res.status(500).json({ message: "메시지 조회 실패" });
-        }
-        res.status(200).json(results);
+    db.query(sql, [roomId], (err, results) => {
+      if (err) {
+        console.error("메시지 조회 실패:", err);
+        return res.status(500).json({ message: "메시지 조회 실패" });
+      }
+      return res.status(200).json(results);
     });
+  }
 });
 
 // 회원가입
@@ -533,7 +705,7 @@ app.post("/api/login", (req, res) => {
         }
 
         if (results.length === 0) {
-            return res.status(401).json({ message: "계정이 없습니다." });
+            return res.status(401).json({ message: "로그인 정보가 올바르지 않습니다." });
         }
 
         try {
@@ -541,16 +713,21 @@ app.post("/api/login", (req, res) => {
             const isMatch = await bcrypt.compare(password, user.password);
 
             if (!isMatch) {
-                return res.status(401).json({ message: "비밀번호가 올바르지 않습니다." });
+                return res.status(401).json({ message: "로그인 정보가 올바르지 않습니다." });
             }
 
+            const safeUser = {
+                user_id: user.user_id,
+                name: user.name,
+                email: user.email,
+                icon: user.icon || "👽",
+            };
+
+            const token = createToken(safeUser);
+
             return res.status(200).json({
-                user: {
-                    user_id: user.user_id,
-                    name: user.name,
-                    email: user.email,
-                    icon: user.icon || "👽",
-                },
+                token,
+                user: safeUser,
             });
         } catch (error) {
             console.error("로그인 비교 오류:", error);
@@ -560,14 +737,11 @@ app.post("/api/login", (req, res) => {
 });
 
 // 강의 저장
-app.post("/api/lectures", (req, res) => {
-    const { user_id, title, raw_text, summary_data } = req.body;
+app.post("/api/lectures", requireAuth, (req, res) => {
+    const user_id = req.user.user_id;
+    const { title, raw_text, summary_data } = req.body;
 
-    console.log("📥 summary_data 타입:", typeof summary_data);
-    console.log("📥 저장 요청 받음:", { user_id, title });
-
-    if (!user_id || !title || !raw_text || !summary_data) {
-        console.log("❌ 누락된 값:", { user_id: !!user_id, title: !!title, raw_text: !!raw_text, summary_data: !!summary_data });
+    if (!title || !raw_text || !summary_data) {
         return res.status(400).json({ message: "강의 저장에 필요한 값이 부족합니다." });
     }
 
@@ -590,11 +764,12 @@ app.post("/api/lectures", (req, res) => {
 });
 
 // 강의 수정
-app.put("/api/lectures/:lectureId", (req, res) => {
+app.put("/api/lectures/:lectureId", requireAuth, (req, res) => {
     const lectureId = req.params.lectureId;
-    const { user_id, title, raw_text, summary_data } = req.body;
+    const user_id = req.user.user_id;
+    const { title, raw_text, summary_data } = req.body;
 
-    if (!user_id || !title || !raw_text || !summary_data) {
+    if (!title || !raw_text || !summary_data) {
         return res.status(400).json({ message: "필수값이 누락되었습니다." });
     }
 
@@ -613,10 +788,11 @@ app.put("/api/lectures/:lectureId", (req, res) => {
 });
 
 // 퀴즈 히스토리 저장
-app.post("/api/quiz-history", (req, res) => {
-    const { user_id, lecture_id, lecture_title, score, correct, total, results } = req.body;
+app.post("/api/quiz-history", requireAuth, (req, res) => {
+    const user_id = req.user.user_id;
+    const { lecture_id, lecture_title, score, correct, total, results } = req.body;
 
-    if (!user_id || score === undefined) {
+    if (score === undefined) {
         return res.status(400).json({ message: "필수값이 누락되었습니다." });
     }
 
@@ -636,9 +812,9 @@ app.post("/api/quiz-history", (req, res) => {
 });
 
 // 퀴즈 히스토리 삭제
-app.delete("/api/quiz-history/:historyId", (req, res) => {
+app.delete("/api/quiz-history/:historyId", requireAuth, (req, res) => {
     const historyId = req.params.historyId;
-    const { user_id } = req.body;
+    const user_id = req.user.user_id;
 
     if (!user_id) {
         return res.status(400).json({ message: "user_id가 필요합니다." });
@@ -659,12 +835,17 @@ app.delete("/api/quiz-history/:historyId", (req, res) => {
 });
 
 // 퀴즈 히스토리 조회
-app.get("/api/quiz-history/:userId", (req, res) => {
-    const userId = req.params.userId;
+app.get("/api/quiz-history/:userId", requireAuth, (req, res) => {
+    const requestedUserId = String(req.params.userId);
+    const tokenUserId = String(req.user.user_id);
+
+    if (requestedUserId !== tokenUserId) {
+        return res.status(403).json({ message: "접근 권한이 없습니다." });
+    }
 
     const sql = `SELECT * FROM quiz_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`;
 
-    db.query(sql, [userId], (err, results) => {
+    db.query(sql, [tokenUserId], (err, results) => {
         if (err) {
             console.error("퀴즈 히스토리 조회 오류:", err);
             return res.status(500).json({ message: "히스토리 조회 실패" });
@@ -674,84 +855,94 @@ app.get("/api/quiz-history/:userId", (req, res) => {
 });
 
 // 강의 삭제
-// 강의 삭제
-app.delete("/api/lectures/:lectureId", (req, res) => {
-  const lectureId = req.params.lectureId;
-  const { user_id } = req.body;
+app.delete("/api/lectures/:lectureId", requireAuth, (req, res) => {
+    const lectureId = req.params.lectureId;
+    const user_id = req.user.user_id;
 
-  if (!user_id) {
-    return res.status(400).json({ message: "user_id가 필요합니다." });
-  }
+    const deleteQuizHistorySql = `DELETE FROM quiz_history WHERE lecture_id = ? AND user_id = ?`;
+    const deleteLectureSql = `DELETE FROM lectures WHERE id = ? AND user_id = ?`;
 
-  const deleteQuizHistorySql = `DELETE FROM quiz_history WHERE lecture_id = ? AND user_id = ?`;
-  const deleteLectureSql = `DELETE FROM lectures WHERE id = ? AND user_id = ?`;
+    db.query(deleteQuizHistorySql, [lectureId, user_id], (quizErr) => {
+        if (quizErr) {
+            console.error("퀴즈 히스토리 삭제 오류:", quizErr);
+            return res.status(500).json({ message: "연결된 퀴즈 기록 삭제 실패" });
+        }
 
-  db.query(deleteQuizHistorySql, [lectureId, user_id], (quizErr) => {
-    if (quizErr) {
-      console.error("퀴즈 히스토리 삭제 오류:", quizErr);
-      return res.status(500).json({ message: "연결된 퀴즈 기록 삭제 실패" });
-    }
+        db.query(deleteLectureSql, [lectureId, user_id], (err, result) => {
+            if (err) {
+                console.error("강의 삭제 오류:", err);
+                return res.status(500).json({ message: "강의 삭제 실패" });
+            }
 
-    db.query(deleteLectureSql, [lectureId, user_id], (err, result) => {
-      if (err) {
-        console.error("강의 삭제 오류:", err);
-        return res.status(500).json({ message: "강의 삭제 실패" });
-      }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
+            }
 
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
-      }
-
-      return res.status(200).json({ message: "강의가 삭제되었습니다." });
+            return res.status(200).json({ message: "강의가 삭제되었습니다." });
+        });
     });
-  });
 });
 
 // 내 강의 목록 조회
-app.get("/api/lectures/:userId", (req, res) => {
-    const userId = req.params.userId;
-    console.log("📌 강의 목록 요청 userId:", userId);
+app.get("/api/lectures/:userId", requireAuth, (req, res) => {
+    const requestedUserId = String(req.params.userId);
+    const sessionUserId = String(req.user.user_id);
+
+    if (requestedUserId !== sessionUserId) {
+        return res.status(403).json({ message: "접근 권한이 없습니다." });
+    }
 
     const sql = `SELECT * FROM lectures WHERE user_id = ? ORDER BY created_at DESC`;
 
-    db.query(sql, [userId], (err, results) => {
+    db.query(sql, [sessionUserId], (err, results) => {
         if (err) {
             console.error("불러오기 에러:", err);
             return res.status(500).json({ message: "데이터 불러오기 실패" });
         }
-        console.log("✅ 조회 결과:", results.length, "건");
 
         return res.status(200).json(results);
+    });
+});
+
+// 로그인 사용자 확인용
+app.get("/api/me", requireAuth, (req, res) => {
+    return res.status(200).json({
+        user: {
+            user_id: req.user.user_id,
+            name: req.user.name,
+            email: req.user.email,
+            icon: req.user.icon || "👽",
+        },
     });
 });
 
 const userContextMap = new Map();
 
 function getUserContext(userId) {
-  return userContextMap.get(String(userId)) || "";
+    return userContextMap.get(String(userId)) || "";
 }
 
 function setUserContext(userId, text) {
-  const prev = getUserContext(userId);
-  const next = `${prev} ${text}`.trim().slice(-2000);
-  userContextMap.set(String(userId), next);
+    const prev = getUserContext(userId);
+    const next = `${prev} ${text}`.trim().slice(-2000);
+    userContextMap.set(String(userId), next);
 }
 
 async function refineText(text) {
-  if (!text || !text.trim()) return "";
+    if (!text || !text.trim()) return "";
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `다음은 강의 음성인식 결과입니다.
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "system",
+                    content: `다음은 강의 음성인식 결과입니다.
 의미는 바꾸지 말고 표기만 교정하세요.
 
 규칙:
@@ -771,155 +962,135 @@ async function refineText(text) {
 - "노드 제이에스" -> "Node.js"
 - "자바 스크립트" -> "JavaScript"
 - "타입 스크립트" -> "TypeScript"`,
-        },
-        {
-          role: "user",
-          content: text,
-        },
-      ],
-      temperature: 0,
-    }),
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error?.message || "전사 보정 실패");
-  }
-
-  return data.choices?.[0]?.message?.content?.trim() || text;
-}
-
-app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ message: "오디오 파일이 없습니다." });
-  }
-
-  const tmpPath = req.file.path;
-
-  try {
-    if (!process.env.GROQ_API_KEY) {
-      throw new Error("GROQ_API_KEY가 설정되지 않았습니다.");
-    }
-
-    if (req.file.size < 4000) {
-      return res.status(200).json({ text: "" });
-    }
-
-    const originalExt = path.extname(req.file.originalname || "").toLowerCase() || ".webm";
-    const contentType =
-      req.file.mimetype ||
-      (originalExt === ".webm"
-        ? "audio/webm"
-        : originalExt === ".ogg"
-        ? "audio/ogg"
-        : originalExt === ".mp4" || originalExt === ".m4a"
-        ? "audio/mp4"
-        : "application/octet-stream");
-
-    const userId = req.body.userId || req.query.userId || "default";
-    const prevContext = getUserContext(userId);
-
-    const formData = new FormData();
-    formData.append("file", fs.createReadStream(tmpPath), {
-      filename: `audio${originalExt}`,
-      contentType,
+                },
+                {
+                    role: "user",
+                    content: text,
+                },
+            ],
+            temperature: 0,
+        }),
     });
-    formData.append("model", "whisper-large-v3-turbo");
-    formData.append("language", "ko");
-    formData.append("temperature", "0");
-    formData.append("response_format", "verbose_json");
 
-    const whisperRes = await fetch(
-      "https://api.groq.com/openai/v1/audio/transcriptions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-          ...formData.getHeaders(),
-        },
-        body: formData,
-      }
-    );
-
-    const rawText = await whisperRes.text();
-
-    if (!whisperRes.ok) {
-      console.error("Groq Whisper 실패:", rawText);
-      throw new Error(`Whisper API 실패: ${whisperRes.status}`);
+    const data = await response.json();
+    if (!response.ok) {
+        throw new Error(data.error?.message || "전사 보정 실패");
     }
 
-    let parsed;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch (parseErr) {
-      console.error("Whisper 응답 JSON 파싱 실패:", rawText);
-      throw new Error("Whisper 응답 파싱에 실패했습니다.");
-    }
-
-    let text = "";
-    if (Array.isArray(parsed.segments)) {
-      text = parsed.segments
-        .filter((seg) => (seg.avg_logprob ?? -1) > -0.9)
-        .map((seg) => String(seg.text || "").trim())
-        .filter(Boolean)
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-    } else {
-      text = String(parsed.text || "").replace(/\s+/g, " ").trim();
-    }
-
-    text = text.replace(/(.{4,15}?)( \1){1,}/g, "$1");
-    text = text.replace(/(감사합니다\.?)( \1)+/g, "$1");
-    text = text.replace(/(안녕하세요\.?)( \1)+/g, "$1");
-
-    const garbagePatterns = [
-  /^안녕하세요[.! ]*$/u,
-  /^감사합니다[.! ]*$/u,
-  /^(감사합니다[.! ]*){2,}$/u,
-  /^(안녕하세요[.! ]*){2,}$/u
-];
-
-if (garbagePatterns.some((p) => p.test(text))) {
-  text = "";
+    return data.choices?.[0]?.message?.content?.trim() || text;
 }
 
-const bannedPhrases = [
-  "한국어 강의를 정확히 전사하세요.",
-  "이 음성은 학교 강의입니다. 한국어로 정확하게 전사하세요. 수식, 전공 용어, 영어 약어(예: CNN, HTTP, API)는 들린 그대로 유지하세요. 문장이 자연스럽게 이어지도록 하되 내용을 임의로 추가하거나 요약하지 마세요."
-];
-
-if (bannedPhrases.some((phrase) => text.includes(phrase))) {
-  text = "";
-}
-
-// 이거 있으니까 계속 이상한말 반복하길래 일단 주석처리함
-// if (text) {
-//  text = await refineText(text);
-//}
-
-// 마지막에 사용자 문맥 저장 인데 애가 계속 반복하고 이상해서 주석처리함
-//if (text) {
-//  setUserContext(userId, text);
-//}
-
-return res.status(200).json({ text });
-  } catch (error) {
-    console.error("/api/transcribe 오류:", error);
-    return res.status(500).json({
-      message: error.message || "음성 변환 중 서버 오류가 발생했습니다.",
-    });
-  } finally {
-    try {
-      if (tmpPath && fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-    } catch (e) {
-      console.error("tmp 파일 삭제 실패:", e);
+app.post("/api/transcribe", requireAuth, upload.single("audio"), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ message: "오디오 파일이 없습니다." });
     }
-  }
+
+    const tmpPath = req.file.path;
+    // wav로 변환할 경로
+    const wavPath = `${tmpPath}.wav`;
+
+    await convertToWav(tmpPath, wavPath);
+
+    try {
+        if (!process.env.GROQ_API_KEY) {
+            throw new Error("GROQ_API_KEY가 설정되지 않았습니다.");
+        }
+
+        if (req.file.size < 4000) {
+            return res.status(200).json({ text: "" });
+        }
+
+        const wavStat = fs.statSync(wavPath);
+        const userId = req.body.userId || req.query.userId || "default";
+
+        const formData = new FormData();
+        formData.append("file", fs.createReadStream(wavPath), {
+            filename: "audio.wav",         // wav로 고정
+            contentType: "audio/wav",      // contentType도 wav로
+        });
+        formData.append("model", "whisper-large-v3-turbo");
+        formData.append("language", "ko");
+        formData.append("temperature", "0");
+        formData.append("response_format", "verbose_json");
+
+        const whisperRes = await fetch(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+                    ...formData.getHeaders(),
+                },
+                body: formData,
+            }
+        );
+
+        const rawText = await whisperRes.text();
+
+        if (!whisperRes.ok) {
+            console.error("Groq Whisper 실패:", rawText);
+            throw new Error(`Whisper API 실패: ${whisperRes.status}`);
+        }
+
+        let parsed;
+        try {
+            parsed = JSON.parse(rawText);
+        } catch {
+            throw new Error("Whisper 응답 파싱에 실패했습니다.");
+        }
+
+        let text = "";
+        if (Array.isArray(parsed.segments)) {
+            text = parsed.segments
+                .filter((seg) => (seg.avg_logprob ?? -1) > -0.9)
+                .map((seg) => String(seg.text || "").trim())
+                .filter(Boolean)
+                .join(" ")
+                .replace(/\s+/g, " ")
+                .trim();
+        } else {
+            text = String(parsed.text || "").replace(/\s+/g, " ").trim();
+        }
+
+        text = text.replace(/(.{4,15}?)( \1){1,}/g, "$1");
+        text = text.replace(/(감사합니다\.?)( \1)+/g, "$1");
+        text = text.replace(/(안녕하세요\.?)( \1)+/g, "$1");
+
+        const noSpeechProb = parsed.segments?.[0]?.no_speech_prob ?? 1;
+        if (noSpeechProb > 0.5) {
+            const garbagePatterns = [
+                /^안녕하세요[.! ]*$/u,
+                /^감사합니다[.! ]*$/u,
+                /^(감사합니다[.! ]*){2,}$/u,
+                /^(안녕하세요[.! ]*){2,}$/u,
+            ];
+            if (garbagePatterns.some((p) => p.test(text))) text = "";
+        }
+
+        const bannedPhrases = [
+            "한국어 강의를 정확히 전사하세요.",
+            "이 음성은 학교 강의입니다.",
+        ];
+        if (bannedPhrases.some((phrase) => text.includes(phrase))) text = "";
+
+        return res.status(200).json({ text });
+    } catch (error) {
+        console.error("/api/transcribe 오류:", error);
+        return res.status(500).json({
+            message: error.message || "음성 변환 중 서버 오류가 발생했습니다.",
+        });
+    } finally {
+        try {
+            if (tmpPath && fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+            if (wavPath && fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+        } catch (e) {
+            console.error("tmp 파일 삭제 실패:", e);
+        }
+    }
 });
 
 // 퀴즈 채점 - GPT
-app.post("/api/grade", async (req, res) => {
+app.post("/api/grade", requireAuth, async (req, res) => {
     const { question, correctAnswer, userAnswer } = req.body;
 
     if (!question || !correctAnswer || !userAnswer) {
@@ -978,7 +1149,7 @@ app.post("/api/grade", async (req, res) => {
 });
 
 // 요약 / 키워드 / 퀴즈 - GPT
-app.post("/api/summarize", async (req, res) => {
+app.post("/api/summarize", requireAuth, async (req, res) => {
     const { text } = req.body;
 
     if (!text || !text.trim()) {
@@ -1041,6 +1212,26 @@ ${text.slice(0, 8000)}
         return res.status(500).json({ message: error.message || "요약 생성 오류" });
     }
 });
+
+function requireAuth(req, res, next) {
+    const authHeader = req.headers.authorization || "";
+    const [type, token] = authHeader.split(" ");
+
+    if (type !== "Bearer" || !token) {
+        return res.status(401).json({ message: "인증이 필요합니다." });
+    }
+
+    try {
+        const decoded = jwt.verify(
+            token,
+            process.env.JWT_SECRET || "change-this-jwt-secret"
+        );
+        req.user = decoded;
+        next();
+    } catch (err) {
+        return res.status(401).json({ message: "유효하지 않은 토큰입니다." });
+    }
+}
 
 server.listen(PORT, () => {
     console.log(`✅ 서버 실행 중: ${PORT}`);
