@@ -55,7 +55,11 @@ const allowedOrigins = [
 
 function createToken(user) {
     return jwt.sign(
-        user,
+        {
+            user_id: user.user_id,
+            name: user.name,
+            email: user.email,
+        },
         process.env.JWT_SECRET,
         { expiresIn: "7d" }
     );
@@ -70,7 +74,7 @@ function requireAuth(req, res, next) {
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
         req.user = decoded;
         next();
     } catch {
@@ -125,7 +129,7 @@ io.use((socket, next) => {
             return next(new Error("인증 필요"));
         }
 
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
         socket.user = decoded;
         next();
     } catch (err) {
@@ -147,9 +151,21 @@ io.on("connection", (socket) => {
         const safeRoomId = String(roomId || "").trim();
         if (!safeRoomId) return;
 
-        // team-room은 허용
+        // team-room은 허용(room_members에 있는 사람만)
         if (safeRoomId === "team-room") {
-            socket.join("team-room");
+            db.query(
+                "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? LIMIT 1",
+                ["team-room", socket.user.user_id],
+                (err, rows) => {
+                    if (err) {
+                        console.error("team-room 권한 확인 실패:", err);
+                        return;
+                    }
+                    if (rows.length > 0) {
+                        socket.join("team-room");
+                    }
+                }
+            );
             return;
         }
 
@@ -231,14 +247,26 @@ io.on("connection", (socket) => {
 
         if (roomId === "team-room") {
             db.query(
-                "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
-                [roomId, "전체 팀 채팅방"],
-                (roomErr) => {
-                    if (roomErr) {
-                        console.error("team-room 생성 실패:", roomErr);
+                "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? LIMIT 1",
+                ["team-room", sender_id],
+                (memberErr, rows) => {
+                    if (memberErr) {
+                        console.error("team-room 권한 확인 실패:", memberErr);
                         return;
                     }
-                    saveMessage();
+                    if (rows.length === 0) return;
+
+                    db.query(
+                        "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
+                        [roomId, "전체 팀 채팅방"],
+                        (roomErr) => {
+                            if (roomErr) {
+                                console.error("team-room 생성 실패:", roomErr);
+                                return;
+                            }
+                            saveMessage();
+                        }
+                    );
                 }
             );
             return;
@@ -301,25 +329,25 @@ io.on("connection", (socket) => {
     });
 
     socket.on("send_notification", (data) => {
-    const targetId = String(data.targetId || "").trim();
-    const allowedTypes = ["friend_request", "friend_accepted", "friend_rejected"];
+        const targetId = String(data.targetId || "").trim();
+        const allowedTypes = ["friend_request", "friend_accepted", "friend_rejected"];
 
-    if (!targetId) return;
-    if (!allowedTypes.includes(data.type)) return; 
+        if (!targetId) return;
+        if (!allowedTypes.includes(data.type)) return;
 
-    const messageMap = {
-        friend_request: `${socket.user.name}님이 친구 요청을 보냈습니다.`,
-        friend_accepted: `${socket.user.name}님이 친구 요청을 수락했습니다.`,
-        friend_rejected: `${socket.user.name}님이 친구 요청을 거절했습니다.`,
-    };
+        const messageMap = {
+            friend_request: `${socket.user.name}님이 친구 요청을 보냈습니다.`,
+            friend_accepted: `${socket.user.name}님이 친구 요청을 수락했습니다.`,
+            friend_rejected: `${socket.user.name}님이 친구 요청을 거절했습니다.`,
+        };
 
-    io.to(`user_${targetId}`).emit("new_notification", {
-        type: data.type,
-        targetId,
-        senderId: socket.user.user_id,
-        message: messageMap[data.type],  
+        io.to(`user_${targetId}`).emit("new_notification", {
+            type: data.type,
+            targetId,
+            senderId: socket.user.user_id,
+            message: messageMap[data.type],
+        });
     });
-});
 
     socket.on("disconnect", () => {
         console.log("소켓 연결 종료:", socket.id);
@@ -565,8 +593,11 @@ app.get("/api/friends/:userId", requireAuth, (req, res) => {
 app.post("/api/chat/rooms", requireAuth, (req, res) => {
     const creatorId = req.user.user_id;
     const { roomName, members } = req.body;
-    if (!members || members.length === 0) return res.status(400).json({ message: "멤버가 없습니다." });
+    if (!members || members.length === 0) {
+        return res.status(400).json({ message: "멤버가 없습니다." });
+    }
 
+    const uniqueMembers = [...new Set([creatorId, ...members.map(Number)])];
     const roomId = `group_${Date.now()}`;
 
     // 1. 방 정보 저장
@@ -577,7 +608,7 @@ app.post("/api/chat/rooms", requireAuth, (req, res) => {
         }
 
         // 2. 멤버 등록 (중첩 배열 구조로 전달)
-        const values = members.map(id => [roomId, id]);
+        const values = uniqueMembers.map(id => [roomId, id]);
         db.query("INSERT INTO room_members (room_id, user_id) VALUES ?", [values], (err) => {
             if (err) {
                 console.error("멤버 등록 DB 에러:", err);
@@ -737,8 +768,17 @@ app.post("/api/signup", async (req, res) => {
             transporter.sendMail(mailOptions, (mailErr) => {
                 if (mailErr) {
                     console.error("메일 발송 실패:", mailErr);
-                    return res.status(500).json({ message: "메일 발송 실패" });
+
+                    db.query("DELETE FROM users WHERE email = ?", [email], (deleteErr) => {
+                        if (deleteErr) {
+                            console.error("회원가입 롤백 실패:", deleteErr);
+                        }
+                        return res.status(500).json({ message: "메일 발송 실패" });
+                    });
+
+                    return;
                 }
+
                 return res.status(201).json({ message: "인증 메일이 발송되었습니다." });
             });
         });
@@ -755,7 +795,20 @@ app.get("/api/verify-email", (req, res) => {
         if (err || result.affectedRows === 0) {
             return res.status(400).send("<h1>인증 실패</h1><p>만료된 토큰이거나 잘못된 접근입니다.</p>");
         }
-        res.status(200).send("<h1>인증 완료! ✨</h1><p>이제 로그인하실 수 있습니다. 창을 닫고 로그인을 진행해주세요.</p>");
+        res.status(200).send(`
+  <html>
+    <head>
+      <meta charset="UTF-8" />
+      <meta http-equiv="refresh" content="2;url=${process.env.FRONTEND_URL}" />
+      <title>이메일 인증 완료</title>
+    </head>
+    <body style="font-family:sans-serif; padding:40px;">
+      <h1>인증 완료! ✨</h1>
+      <p>잠시 후 로그인 페이지로 이동합니다.</p>
+      <p>자동으로 이동하지 않으면 <a href="${process.env.FRONTEND_URL}">여기를 클릭</a>하세요.</p>
+    </body>
+  </html>
+`);
     });
 });
 
@@ -781,6 +834,51 @@ app.post("/api/login", (req, res) => {
         const safeUser = { user_id: user.user_id, name: user.name, email: user.email };
         const token = createToken(safeUser);
         return res.status(200).json({ token, user: safeUser });
+    });
+});
+// 인증 메일 재발송 API
+app.post("/api/resend-verification", async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: "이메일이 필요합니다." });
+
+    db.query("SELECT * FROM users WHERE email = ?", [email.trim()], async (err, results) => {
+        if (err) return res.status(500).json({ message: "DB 오류" });
+        if (results.length === 0) return res.status(404).json({ message: "가입되지 않은 이메일입니다." });
+
+        const user = results[0];
+        if (user.is_verified) return res.status(400).json({ message: "이미 인증된 이메일입니다." });
+
+        const newToken = crypto.randomBytes(32).toString("hex");
+        const verifyUrl = `${process.env.BACKEND_URL || "http://localhost:5000"}/api/verify-email?token=${newToken}`;
+
+        db.query("UPDATE users SET verification_token = ? WHERE email = ?", [newToken, email.trim()], (updateErr) => {
+            if (updateErr) return res.status(500).json({ message: "토큰 업데이트 실패" });
+
+            const transporter = email.includes("naver.com") ? naverTransporter : gmailTransporter;
+            const fromUser = email.includes("naver.com") ? process.env.NAVER_USER : process.env.GMAIL_USER;
+
+            transporter.sendMail({
+                from: `Lecture AI <${fromUser}>`,
+                to: email.trim(),
+                subject: "[Lecture AI] 인증 메일 재발송",
+                html: `
+                  <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
+                    <div style="max-width:500px;margin:0 auto;background:white;padding:20px;border-radius:12px;border:1px solid #eee;">
+                      <h2 style="color:#2383e2;">인증 메일 재발송 안내</h2>
+                      <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
+                      <a href="${verifyUrl}" style="display:inline-block;padding:12px 24px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;margin:20px 0;">이메일 인증하기</a>
+                      <p style="font-size:12px;color:#999;">이전 인증 링크는 더 이상 사용할 수 없습니다.</p>
+                    </div>
+                  </div>
+                `,
+            }, (mailErr) => {
+                if (mailErr) {
+                    console.error("재발송 메일 실패:", mailErr);
+                    return res.status(500).json({ message: "메일 발송 실패" });
+                }
+                return res.status(200).json({ message: "인증 메일이 재발송되었습니다." });
+            });
+        });
     });
 });
 
@@ -1039,7 +1137,7 @@ app.post("/api/transcribe", requireAuth, upload.single("audio"), async (req, res
 
 
     try {
-   	await convertToWav(tmpPath, wavPath);
+        await convertToWav(tmpPath, wavPath);
 
         if (!process.env.GROQ_API_KEY) {
             throw new Error("GROQ_API_KEY가 설정되지 않았습니다.");
