@@ -17,6 +17,23 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 require("dotenv").config();
 
+const lectureUploadDir = "lecture_uploads/";
+if (!fs.existsSync(lectureUploadDir)) {
+    fs.mkdirSync(lectureUploadDir, { recursive: true });
+}
+
+const lectureFileStorage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        cb(null, lectureUploadDir);
+    },
+    filename: function (req, file, cb) {
+        const ext = path.extname(file.originalname);
+        cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+    },
+});
+
+const lectureFileUpload = multer({ storage: lectureFileStorage });
+
 if (!fs.existsSync("uploads_tmp/")) fs.mkdirSync("uploads_tmp/", { recursive: true });
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
@@ -48,6 +65,8 @@ if (!process.env.JWT_SECRET) {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+app.use("/lecture_uploads", express.static("lecture_uploads"));
+
 const allowedOrigins = [
     "http://localhost:3000",
     process.env.FRONTEND_URL,
@@ -55,11 +74,7 @@ const allowedOrigins = [
 
 function createToken(user) {
     return jwt.sign(
-        {
-            user_id: user.user_id,
-            name: user.name,
-            email: user.email,
-        },
+        user,
         process.env.JWT_SECRET,
         { expiresIn: "7d" }
     );
@@ -74,7 +89,7 @@ function requireAuth(req, res, next) {
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
         req.user = decoded;
         next();
     } catch {
@@ -129,7 +144,7 @@ io.use((socket, next) => {
             return next(new Error("인증 필요"));
         }
 
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
         socket.user = decoded;
         next();
     } catch (err) {
@@ -151,21 +166,9 @@ io.on("connection", (socket) => {
         const safeRoomId = String(roomId || "").trim();
         if (!safeRoomId) return;
 
-        // team-room은 허용(room_members에 있는 사람만)
+        // team-room은 허용
         if (safeRoomId === "team-room") {
-            db.query(
-                "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? LIMIT 1",
-                ["team-room", socket.user.user_id],
-                (err, rows) => {
-                    if (err) {
-                        console.error("team-room 권한 확인 실패:", err);
-                        return;
-                    }
-                    if (rows.length > 0) {
-                        socket.join("team-room");
-                    }
-                }
-            );
+            socket.join("team-room");
             return;
         }
 
@@ -247,26 +250,14 @@ io.on("connection", (socket) => {
 
         if (roomId === "team-room") {
             db.query(
-                "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? LIMIT 1",
-                ["team-room", sender_id],
-                (memberErr, rows) => {
-                    if (memberErr) {
-                        console.error("team-room 권한 확인 실패:", memberErr);
+                "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
+                [roomId, "전체 팀 채팅방"],
+                (roomErr) => {
+                    if (roomErr) {
+                        console.error("team-room 생성 실패:", roomErr);
                         return;
                     }
-                    if (rows.length === 0) return;
-
-                    db.query(
-                        "INSERT IGNORE INTO chat_rooms (room_id, room_name, is_group) VALUES (?, ?, true)",
-                        [roomId, "전체 팀 채팅방"],
-                        (roomErr) => {
-                            if (roomErr) {
-                                console.error("team-room 생성 실패:", roomErr);
-                                return;
-                            }
-                            saveMessage();
-                        }
-                    );
+                    saveMessage();
                 }
             );
             return;
@@ -593,11 +584,8 @@ app.get("/api/friends/:userId", requireAuth, (req, res) => {
 app.post("/api/chat/rooms", requireAuth, (req, res) => {
     const creatorId = req.user.user_id;
     const { roomName, members } = req.body;
-    if (!members || members.length === 0) {
-        return res.status(400).json({ message: "멤버가 없습니다." });
-    }
+    if (!members || members.length === 0) return res.status(400).json({ message: "멤버가 없습니다." });
 
-    const uniqueMembers = [...new Set([creatorId, ...members.map(Number)])];
     const roomId = `group_${Date.now()}`;
 
     // 1. 방 정보 저장
@@ -608,7 +596,7 @@ app.post("/api/chat/rooms", requireAuth, (req, res) => {
         }
 
         // 2. 멤버 등록 (중첩 배열 구조로 전달)
-        const values = uniqueMembers.map(id => [roomId, id]);
+        const values = members.map(id => [roomId, id]);
         db.query("INSERT INTO room_members (room_id, user_id) VALUES ?", [values], (err) => {
             if (err) {
                 console.error("멤버 등록 DB 에러:", err);
@@ -768,17 +756,8 @@ app.post("/api/signup", async (req, res) => {
             transporter.sendMail(mailOptions, (mailErr) => {
                 if (mailErr) {
                     console.error("메일 발송 실패:", mailErr);
-
-                    db.query("DELETE FROM users WHERE email = ?", [email], (deleteErr) => {
-                        if (deleteErr) {
-                            console.error("회원가입 롤백 실패:", deleteErr);
-                        }
-                        return res.status(500).json({ message: "메일 발송 실패" });
-                    });
-
-                    return;
+                    return res.status(500).json({ message: "메일 발송 실패" });
                 }
-
                 return res.status(201).json({ message: "인증 메일이 발송되었습니다." });
             });
         });
@@ -795,20 +774,7 @@ app.get("/api/verify-email", (req, res) => {
         if (err || result.affectedRows === 0) {
             return res.status(400).send("<h1>인증 실패</h1><p>만료된 토큰이거나 잘못된 접근입니다.</p>");
         }
-        res.status(200).send(`
-  <html>
-    <head>
-      <meta charset="UTF-8" />
-      <meta http-equiv="refresh" content="2;url=${process.env.FRONTEND_URL}" />
-      <title>이메일 인증 완료</title>
-    </head>
-    <body style="font-family:sans-serif; padding:40px;">
-      <h1>인증 완료! ✨</h1>
-      <p>잠시 후 로그인 페이지로 이동합니다.</p>
-      <p>자동으로 이동하지 않으면 <a href="${process.env.FRONTEND_URL}">여기를 클릭</a>하세요.</p>
-    </body>
-  </html>
-`);
+        res.status(200).send("<h1>인증 완료! ✨</h1><p>이제 로그인하실 수 있습니다. 창을 닫고 로그인을 진행해주세요.</p>");
     });
 });
 
@@ -883,24 +849,47 @@ app.post("/api/resend-verification", async (req, res) => {
 });
 
 // 강의 저장
-app.post("/api/lectures", requireAuth, (req, res) => {
+app.post("/api/lectures", requireAuth, lectureFileUpload.array("files", 10), (req, res) => {
     const user_id = req.user.user_id;
     const { title, raw_text, summary_data } = req.body;
+
+    const files = (req.files || []).map((file) => ({
+        originalName: file.originalname,
+        filename: file.filename,
+        path: `/lecture_uploads/${file.filename}`,
+        mimetype: file.mimetype,
+    }));
 
     if (!title || !raw_text || !summary_data) {
         return res.status(400).json({ message: "강의 저장에 필요한 값이 부족합니다." });
     }
 
+    let parsedSummaryData = {};
+    try {
+        parsedSummaryData =
+            typeof summary_data === "string"
+                ? JSON.parse(summary_data)
+                : summary_data;
+    } catch {
+        parsedSummaryData = {};
+    }
+
+    const fullSummaryData = {
+        ...parsedSummaryData,
+        files,
+    };
+
     const sql = `INSERT INTO lectures (user_id, title, raw_text, summary_data) VALUES (?, ?, ?, ?)`;
 
     db.query(
         sql,
-        [user_id, title, raw_text, JSON.stringify(summary_data)],
+        [user_id, title, raw_text, JSON.stringify(fullSummaryData)],
         (err, result) => {
             if (err) {
                 console.error("DB 저장 에러:", err);
                 return res.status(500).json({ message: "강의 저장 실패" });
             }
+
             return res.status(201).json({
                 message: "강의가 DB에 안전하게 저장되었습니다!",
                 id: result.insertId,
@@ -910,8 +899,8 @@ app.post("/api/lectures", requireAuth, (req, res) => {
 });
 
 // 강의 수정
-app.put("/api/lectures/:lectureId", requireAuth, (req, res) => {
-    const lectureId = req.params.lectureId;
+app.put("/api/lectures/:id", lectureFileUpload.array("files", 10), requireAuth, (req, res) => {
+    const lectureId = req.params.id;
     const user_id = req.user.user_id;
     const { title, raw_text, summary_data } = req.body;
 
@@ -919,16 +908,43 @@ app.put("/api/lectures/:lectureId", requireAuth, (req, res) => {
         return res.status(400).json({ message: "필수값이 누락되었습니다." });
     }
 
+    let parsedSummaryData = {};
+    try {
+        parsedSummaryData =
+            typeof summary_data === "string"
+                ? JSON.parse(summary_data)
+                : summary_data;
+    } catch {
+        parsedSummaryData = {};
+    }
+
+    const uploadedFiles = (req.files || []).map((file) => ({
+        originalName: file.originalname,
+        filename: file.filename,
+        path: `/lecture_uploads/${file.filename}`,
+        mimetype: file.mimetype,
+    }));
+
+    const nextSummaryData = {
+        ...parsedSummaryData,
+        files: [
+            ...(Array.isArray(parsedSummaryData.files) ? parsedSummaryData.files : []),
+            ...uploadedFiles,
+        ],
+    };
+
     const sql = `UPDATE lectures SET title = ?, raw_text = ?, summary_data = ? WHERE id = ? AND user_id = ?`;
 
-    db.query(sql, [title, raw_text, JSON.stringify(summary_data), lectureId, user_id], (err, result) => {
+    db.query(sql, [title, raw_text, JSON.stringify(nextSummaryData), lectureId, user_id], (err, result) => {
         if (err) {
             console.error("강의 수정 오류:", err);
             return res.status(500).json({ message: "강의 수정 실패" });
         }
+
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
         }
+
         return res.status(200).json({ message: "강의가 수정되었습니다." });
     });
 });
@@ -1306,13 +1322,134 @@ app.post("/api/grade", requireAuth, async (req, res) => {
 
 // 요약 / 키워드 / 퀴즈 - GPT
 app.post("/api/summarize", requireAuth, async (req, res) => {
-    const { text } = req.body;
+  const { text } = req.body;
+  if (!text?.trim()) return res.status(400).json({ message: "텍스트가 없습니다." });
 
-    if (!text || !text.trim()) {
-        return res.status(400).json({ message: "텍스트가 없습니다." });
+  try {
+    const prompt = `
+다음 강의 내용을 분석해서 반드시 JSON 형식으로만 응답해.
+
+설명 문장 절대 쓰지 말고 JSON만 반환해.
+
+중요:
+- keywords 배열에는 실제 핵심 키워드만 넣어라.
+- keywordExplanations의 key는 반드시 keywords 배열에 들어간 실제 키워드 문자열과 완전히 같아야 한다.
+- "키워드1", "키워드2" 같은 임시 이름은 절대 사용하지 마라.
+
+예시:
+{
+  "summary": "한국어 요약 3~5문장",
+  "keywords": ["위대한 개츠비", "아메리칸 드림", "인간의 욕망"],
+  "keywordExplanations": {
+    "위대한 개츠비": "피츠제럴드의 소설로 인간의 욕망과 이상을 다룬 작품이다.",
+    "아메리칸 드림": "노력하면 누구나 성공할 수 있다는 미국 사회의 이상이다.",
+    "인간의 욕망": "더 나은 삶과 성공을 추구하는 인간의 본성이다."
+  },
+  "quiz": [
+    { "question": "문제", "answer": "정답" },
+    { "question": "문제", "answer": "정답" },
+    { "question": "문제", "answer": "정답" }
+  ]
+}
+
+조건:
+- keywords는 3~5개
+- keywordExplanations는 반드시 포함
+- keywordExplanations의 key는 keywords 배열과 완전히 동일해야 함
+- keywords의 모든 항목에 대해 설명 생성 (1:1 대응)
+- 하나라도 빠지면 안 됨
+- 설명은 쉬운 한국어로 작성
+- 강의 맥락 기반 설명
+
+강의 내용:
+${text.slice(0, 8000)}
+`;
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || "GPT 실패");
     }
 
+    const raw = data.choices[0].message.content.trim();
+
+    // JSON 추출 (안전하게)
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) {
+      throw new Error("JSON 파싱 실패");
+    }
+
+    const parsed = JSON.parse(match[0]);
+
+    return res.status(200).json(parsed);
+  } catch (err) {
+    console.error("요약 오류:", err);
+    return res.status(500).json({ message: err.message || "요약 오류" });
+  }
+});
+
+app.post("/api/translate-summarize", requireAuth, async (req, res) => {
+    const { text, sourceLang } = req.body;
+    if (!text?.trim()) return res.status(400).json({ message: "텍스트가 없습니다." });
+
     try {
+        const prompt = `
+다음 강의 내용을 분석해서 반드시 JSON 형식으로만 응답해.
+
+설명 문장 절대 쓰지 말고 JSON만 반환해.
+
+중요:
+- keywords 배열에는 실제 핵심 키워드만 넣어라.
+- keywordExplanations의 key는 반드시 keywords 배열에 들어간 실제 키워드 문자열과 완전히 같아야 한다.
+- "키워드1", "키워드2" 같은 임시 이름은 절대 사용하지 마라.
+
+예시:
+{
+  "translatedText": "전체 한국어 번역",
+  "summary": "한국어 요약 3~5문장",
+  "keywords": ["위대한 개츠비", "아메리칸 드림", "인간의 욕망"],
+  "keywordExplanations": {
+    "위대한 개츠비": "피츠제럴드의 소설로, 부와 사랑 그리고 이상을 좇는 인간의 모습을 보여주는 작품이다.",
+    "아메리칸 드림": "노력하면 누구나 성공할 수 있다는 미국 사회의 이상을 뜻한다.",
+    "인간의 욕망": "사람이 더 나은 삶이나 성공, 사랑 등을 얻고 싶어 하는 마음을 뜻한다."
+  },
+  "quiz": [
+    { "question": "문제", "answer": "정답" },
+    { "question": "문제", "answer": "정답" },
+    { "question": "문제", "answer": "정답" }
+  ]
+}
+
+조건:
+- keywords는 3~5개
+- keywordExplanations는 반드시 포함
+- keywordExplanations의 모든 key는 keywords 배열의 값과 완전히 동일해야 함
+- keywords의 모든 항목에 대해 설명을 만들어라
+- 하나라도 빠지면 안 됨
+- 설명은 반드시 쉬운 한국어로 작성
+- 강의 맥락 기반 설명
+
+강의 내용:
+${text.slice(0, 8000)}
+`;
+
         const response = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -1324,23 +1461,7 @@ app.post("/api/summarize", requireAuth, async (req, res) => {
                 messages: [
                     {
                         role: "user",
-                        content: `다음 강의 내용을 분석해서 반드시 아래 JSON 형식으로만 응답해. 분야에 상관없이(인문, 과학, 공학, 예술 등) 핵심 내용을 추출해줘.
-
-강의 내용:
-"""
-${text.slice(0, 8000)}
-"""
-
-응답 형식:
-{
-  "summary": "강의의 전체적인 맥락과 핵심 논리를 포함한 3~5문장 요약",
-  "keywords": ["주제와 관련된 가장 중요하고 시험에 나올법한 핵심 용어 5개"],
-  "quiz": [
-    { "question": "강의 내용의 핵심 원리나 개념을 묻는 추론형 질문1", "answer": "구체적인 근거가 포함된 답안1" },
-    { "question": "강의에서 강조된 주요 사례나 이론을 확인하는 질문2", "answer": "구체적인 근거가 포함된 답안2" },
-    { "question": "학습자가 개념을 응용해볼 수 있는 질문3", "answer": "구체적인 근거가 포함된 답안3" }
-  ]
-}`,
+                        content: prompt,
                     },
                 ],
             }),
@@ -1349,23 +1470,23 @@ ${text.slice(0, 8000)}
         const data = await response.json();
 
         if (!response.ok) {
-            throw new Error(data.error?.message || "GPT 요청 실패");
+            throw new Error(data.error?.message || "GPT 실패");
         }
 
         const raw = data.choices[0].message.content.trim();
-        const jsonMatch = raw.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("JSON 파싱 실패");
 
-        const parsed = JSON.parse(jsonMatch[0]);
+        // JSON 추출 (안전하게)
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) {
+            throw new Error("JSON 파싱 실패");
+        }
 
-        return res.status(200).json({
-            summary: parsed.summary || "",
-            keywords: Array.isArray(parsed.keywords) ? parsed.keywords : [],
-            quiz: Array.isArray(parsed.quiz) ? parsed.quiz : [],
-        });
-    } catch (error) {
-        console.error("GPT 오류:", error);
-        return res.status(500).json({ message: error.message || "요약 생성 오류" });
+        const parsed = JSON.parse(match[0]);
+
+        return res.status(200).json(parsed);
+    } catch (err) {
+        console.error("요약 오류:", err);
+        return res.status(500).json({ message: err.message || "요약 오류" });
     }
 });
 
