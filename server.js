@@ -136,6 +136,8 @@ const io = new Server(server, {
     },
 });
 
+app.set("io", io);
+
 io.use((socket, next) => {
     try {
         const token = socket.handshake.auth?.token;
@@ -1322,11 +1324,36 @@ app.post("/api/grade", requireAuth, async (req, res) => {
 
 // 요약 / 키워드 / 퀴즈 - GPT
 app.post("/api/summarize", requireAuth, async (req, res) => {
-  const { text } = req.body;
-  if (!text?.trim()) return res.status(400).json({ message: "텍스트가 없습니다." });
+    const { text, quizCount = 3, quizDifficulty = "보통", quizTypes = ["short"] } = req.body;
+    if (!text?.trim()) return res.status(400).json({ message: "텍스트가 없습니다." });
 
-  try {
-    const prompt = `
+    // 난이도별 프롬프트 지시
+    const difficultyGuide = {
+        "쉬움": "기본 개념을 확인하는 쉬운 문제. 강의에서 직접 언급된 핵심 내용만 묻는다.",
+        "보통": "개념의 이해와 적용을 묻는 중간 난이도. 단순 암기가 아닌 이해를 확인한다.",
+        "어려움": "심화 개념, 비교·분석·추론을 요구하는 어려운 문제. 강의 내용을 깊이 이해해야 풀 수 있다."
+    };
+
+    // 유형별 예시 생성
+    const typeExamples = [];
+    const hasShort = quizTypes.includes("short");
+    const hasMcq = quizTypes.includes("mcq");
+    const hasOx = quizTypes.includes("ox");
+
+    if (hasShort) typeExamples.push(`{ "type": "short", "question": "단답형 문제", "answer": "정답" }`);
+    if (hasMcq) typeExamples.push(`{ "type": "mcq", "question": "객관식 문제", "choices": ["①보기1", "②보기2", "③보기3", "④보기4"], "answer": "①보기1" }`);
+    if (hasOx) typeExamples.push(`{ "type": "ox", "question": "OX로 답할 수 있는 문장형 문제", "answer": "O" }`);
+
+    let typeInstruction = "";
+    if (quizTypes.length === 1) {
+        const typeNames = { short: "단답형", mcq: "객관식(4지선다)", ox: "OX" };
+        typeInstruction = `모든 문제를 ${typeNames[quizTypes[0]]} 유형으로만 만들어라.`;
+    } else {
+        typeInstruction = `문제 유형을 아래 유형들 사이에서 골고루 섞어라: ${quizTypes.map(t => ({ short: "단답형", mcq: "객관식", ox: "OX" }[t])).join(", ")}.`;
+    }
+
+    try {
+        const prompt = `
 다음 강의 내용을 분석해서 반드시 JSON 형식으로만 응답해.
 
 설명 문장 절대 쓰지 말고 JSON만 반환해.
@@ -1336,7 +1363,14 @@ app.post("/api/summarize", requireAuth, async (req, res) => {
 - keywordExplanations의 key는 반드시 keywords 배열에 들어간 실제 키워드 문자열과 완전히 같아야 한다.
 - "키워드1", "키워드2" 같은 임시 이름은 절대 사용하지 마라.
 
-예시:
+퀴즈 조건:
+- 문제 수: 정확히 ${quizCount}개
+- 난이도: ${quizDifficulty} → ${difficultyGuide[quizDifficulty] || difficultyGuide["보통"]}
+- 유형: ${typeInstruction}
+- 객관식(mcq) 보기는 반드시 4개, 정답은 보기 중 하나와 정확히 일치해야 함
+- OX 문제 정답은 반드시 "O" 또는 "X" 중 하나
+
+예시 구조:
 {
   "summary": "한국어 요약 3~5문장",
   "keywords": ["위대한 개츠비", "아메리칸 드림", "인간의 욕망"],
@@ -1346,9 +1380,7 @@ app.post("/api/summarize", requireAuth, async (req, res) => {
     "인간의 욕망": "더 나은 삶과 성공을 추구하는 인간의 본성이다."
   },
   "quiz": [
-    { "question": "문제", "answer": "정답" },
-    { "question": "문제", "answer": "정답" },
-    { "question": "문제", "answer": "정답" }
+    ${typeExamples.join(",\n    ")}
   ]
 }
 
@@ -1365,49 +1397,71 @@ app.post("/api/summarize", requireAuth, async (req, res) => {
 ${text.slice(0, 8000)}
 `;
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-      }),
-    });
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [
+                    {
+                        role: "user",
+                        content: prompt,
+                    },
+                ],
+            }),
+        });
 
-    const data = await response.json();
+        const data = await response.json();
 
-    if (!response.ok) {
-      throw new Error(data.error?.message || "GPT 실패");
+        if (!response.ok) {
+            throw new Error(data.error?.message || "GPT 실패");
+        }
+
+        const raw = data.choices[0].message.content.trim();
+
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (!match) {
+            throw new Error("JSON 파싱 실패");
+        }
+
+        const parsed = JSON.parse(match[0]);
+
+        return res.status(200).json(parsed);
+    } catch (err) {
+        console.error("요약 오류:", err);
+        return res.status(500).json({ message: err.message || "요약 오류" });
     }
-
-    const raw = data.choices[0].message.content.trim();
-
-    // JSON 추출 (안전하게)
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) {
-      throw new Error("JSON 파싱 실패");
-    }
-
-    const parsed = JSON.parse(match[0]);
-
-    return res.status(200).json(parsed);
-  } catch (err) {
-    console.error("요약 오류:", err);
-    return res.status(500).json({ message: err.message || "요약 오류" });
-  }
 });
 
 app.post("/api/translate-summarize", requireAuth, async (req, res) => {
-    const { text, sourceLang } = req.body;
+    const { text, sourceLang, quizCount = 3, quizDifficulty = "보통", quizTypes = ["short"] } = req.body;
     if (!text?.trim()) return res.status(400).json({ message: "텍스트가 없습니다." });
+
+    const difficultyGuide = {
+        "쉬움": "기본 개념을 확인하는 쉬운 문제. 강의에서 직접 언급된 핵심 내용만 묻는다.",
+        "보통": "개념의 이해와 적용을 묻는 중간 난이도. 단순 암기가 아닌 이해를 확인한다.",
+        "어려움": "심화 개념, 비교·분석·추론을 요구하는 어려운 문제. 강의 내용을 깊이 이해해야 풀 수 있다."
+    };
+
+    const typeExamples = [];
+    const hasShort = quizTypes.includes("short");
+    const hasMcq = quizTypes.includes("mcq");
+    const hasOx = quizTypes.includes("ox");
+
+    if (hasShort) typeExamples.push(`{ "type": "short", "question": "단답형 문제", "answer": "정답" }`);
+    if (hasMcq) typeExamples.push(`{ "type": "mcq", "question": "객관식 문제", "choices": ["①보기1", "②보기2", "③보기3", "④보기4"], "answer": "①보기1" }`);
+    if (hasOx) typeExamples.push(`{ "type": "ox", "question": "OX로 답할 수 있는 문장형 문제", "answer": "O" }`);
+
+    let typeInstruction = "";
+    if (quizTypes.length === 1) {
+        const typeNames = { short: "단답형", mcq: "객관식(4지선다)", ox: "OX" };
+        typeInstruction = `모든 문제를 ${typeNames[quizTypes[0]]} 유형으로만 만들어라.`;
+    } else {
+        typeInstruction = `문제 유형을 아래 유형들 사이에서 골고루 섞어라: ${quizTypes.map(t => ({ short: "단답형", mcq: "객관식", ox: "OX" }[t])).join(", ")}.`;
+    }
 
     try {
         const prompt = `
@@ -1420,7 +1474,14 @@ app.post("/api/translate-summarize", requireAuth, async (req, res) => {
 - keywordExplanations의 key는 반드시 keywords 배열에 들어간 실제 키워드 문자열과 완전히 같아야 한다.
 - "키워드1", "키워드2" 같은 임시 이름은 절대 사용하지 마라.
 
-예시:
+퀴즈 조건:
+- 문제 수: 정확히 ${quizCount}개
+- 난이도: ${quizDifficulty} → ${difficultyGuide[quizDifficulty] || difficultyGuide["보통"]}
+- 유형: ${typeInstruction}
+- 객관식(mcq) 보기는 반드시 4개, 정답은 보기 중 하나와 정확히 일치해야 함
+- OX 문제 정답은 반드시 "O" 또는 "X" 중 하나
+
+예시 구조:
 {
   "translatedText": "전체 한국어 번역",
   "summary": "한국어 요약 3~5문장",
@@ -1431,9 +1492,7 @@ app.post("/api/translate-summarize", requireAuth, async (req, res) => {
     "인간의 욕망": "사람이 더 나은 삶이나 성공, 사랑 등을 얻고 싶어 하는 마음을 뜻한다."
   },
   "quiz": [
-    { "question": "문제", "answer": "정답" },
-    { "question": "문제", "answer": "정답" },
-    { "question": "문제", "answer": "정답" }
+    ${typeExamples.join(",\n    ")}
   ]
 }
 
@@ -1475,7 +1534,7 @@ ${text.slice(0, 8000)}
 
         const raw = data.choices[0].message.content.trim();
 
-        // JSON 추출 (안전하게)
+        // JSON 추출
         const match = raw.match(/\{[\s\S]*\}/);
         if (!match) {
             throw new Error("JSON 파싱 실패");
@@ -1490,7 +1549,80 @@ ${text.slice(0, 8000)}
     }
 });
 
+// 퀴즈 전용 생성 API (요약과 분리)
+app.post("/api/generate-quiz", requireAuth, async (req, res) => {
+    const { text, quizCount = 3, quizDifficulty = "보통", quizTypes = ["short"] } = req.body;
+    if (!text?.trim()) return res.status(400).json({ message: "텍스트가 없습니다." });
+
+    const difficultyGuide = {
+        "쉬움": "강의에서 직접 언급된 핵심 사실만 묻는 쉬운 문제를 만들어라. 답이 명확하고 짧아야 한다.",
+        "보통": "개념의 이해와 적용을 묻는 중간 난이도 문제를 만들어라.",
+        "어려움": "심화 개념, 비교·분석·추론이 필요한 어려운 문제를 만들어라."
+    };
+
+    const typeNames = { short: "단답형", mcq: "객관식(4지선다)", ox: "OX" };
+    const allowedTypes = quizTypes.map(t => typeNames[t] || t).join(", ");
+
+    // 유형별 JSON 예시 생성
+    const buildTypeExamples = () => {
+        const ex = [];
+        if (quizTypes.includes("short")) ex.push(`{ "type": "short", "question": "단답형 질문", "answer": "정답" }`);
+        if (quizTypes.includes("mcq")) ex.push(`{ "type": "mcq", "question": "객관식 질문", "choices": ["①보기1", "②보기2", "③보기3", "④보기4"], "answer": "①보기1" }`);
+        if (quizTypes.includes("ox")) ex.push(`{ "type": "ox", "question": "OX 판단 문장", "answer": "O" }`);
+        return ex.join(",\n    ");
+    };
+
+    const prompt = `
+다음 강의 내용을 바탕으로 퀴즈를 생성해라.
+반드시 JSON 배열만 반환해라. 설명, 주석, 마크다운 없이 순수 JSON 배열만.
+
+조건:
+- 문제 수: 정확히 ${quizCount}개
+- 난이도: ${quizDifficulty} → ${difficultyGuide[quizDifficulty]}
+- 허용 유형: 반드시 [${allowedTypes}] 중에서만 출제하라. 다른 유형은 절대 사용 금지.
+- 유형이 여러 개면 고르게 섞어라.
+- 객관식 보기는 정확히 4개, 정답은 보기 중 하나와 완전히 동일해야 함.
+- OX 정답은 반드시 "O" 또는 "X" 중 하나.
+
+출력 형식 (JSON 배열, 다른 텍스트 없음):
+[
+    ${buildTypeExamples()}
+]
+
+강의 내용:
+${text.slice(0, 8000)}
+`;
+
+    try {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [{ role: "user", content: prompt }],
+            }),
+        });
+
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error?.message || "GPT 실패");
+
+        const raw = data.choices[0].message.content.trim();
+        const match = raw.match(/\[[\s\S]*\]/);
+        if (!match) throw new Error("JSON 파싱 실패");
+
+        const quiz = JSON.parse(match[0]);
+        return res.status(200).json({ quiz });
+    } catch (err) {
+        console.error("퀴즈 생성 오류:", err);
+        return res.status(500).json({ message: err.message || "퀴즈 생성 오류" });
+    }
+});
+
+
+
 server.listen(PORT, () => {
     console.log(`✅ 서버 실행 중: ${PORT}`);
 });
-
