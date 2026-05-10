@@ -89,7 +89,7 @@ function requireAuth(req, res, next) {
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
         req.user = decoded;
         next();
     } catch {
@@ -146,7 +146,7 @@ io.use((socket, next) => {
             return next(new Error("인증 필요"));
         }
 
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret");
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
         socket.user = decoded;
         next();
     } catch (err) {
@@ -447,27 +447,6 @@ app.post("/api/friends/request", requireAuth, (req, res) => {
     );
 });
 
-// 받은 친구 요청 목록
-app.get("/api/friends/requests/:userId", requireAuth, (req, res) => {
-    const userId = req.user.user_id;
-
-    const sql = `
-        SELECT u.user_id, u.name, u.email
-        FROM friends f
-        JOIN users u ON u.user_id = f.user_id
-        WHERE f.friend_id = ?
-          AND f.status = 'pending'
-        ORDER BY u.name ASC
-    `;
-
-    db.query(sql, [userId], (err, results) => {
-        if (err) {
-            console.error("받은 친구 요청 조회 실패:", err);
-            return res.status(500).json({ message: "받은 친구 요청 조회 실패" });
-        }
-        return res.status(200).json(results);
-    });
-});
 
 // 보낸 친구 요청 목록
 app.get("/api/friends/requests/sent/:userId", requireAuth, (req, res) => {
@@ -497,6 +476,29 @@ app.get("/api/friends/requests/sent/:userId", requireAuth, (req, res) => {
         return res.status(200).json(results);
     });
 });
+
+// 받은 친구 요청 목록
+app.get("/api/friends/requests/:userId", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+
+    const sql = `
+        SELECT u.user_id, u.name, u.email
+        FROM friends f
+        JOIN users u ON u.user_id = f.user_id
+        WHERE f.friend_id = ?
+          AND f.status = 'pending'
+        ORDER BY u.name ASC
+    `;
+
+    db.query(sql, [userId], (err, results) => {
+        if (err) {
+            console.error("받은 친구 요청 조회 실패:", err);
+            return res.status(500).json({ message: "받은 친구 요청 조회 실패" });
+        }
+        return res.status(200).json(results);
+    });
+});
+
 
 // 친구 요청 수락 / 거절
 app.patch("/api/friends/request/respond", requireAuth, (req, res) => {
@@ -752,18 +754,23 @@ app.post("/api/signup", async (req, res) => {
 
             const transporter = email.includes("naver.com") ? naverTransporter : gmailTransporter;
             const fromUser = email.includes("naver.com") ? process.env.NAVER_USER : process.env.GMAIL_USER;
-
             mailOptions.from = `Lecture AI <${fromUser}>`;
 
             transporter.sendMail(mailOptions, (mailErr) => {
                 if (mailErr) {
                     console.error("메일 발송 실패:", mailErr);
-                    return res.status(500).json({ message: "메일 발송 실패" });
+                    // ✅ 메일 실패 시 삽입한 유저 롤백
+                    db.query("DELETE FROM users WHERE email = ?", [email], (delErr) => {
+                        if (delErr) console.error("유저 롤백 실패:", delErr);
+                    });
+                    return res.status(500).json({ message: "메일 발송에 실패했습니다. 이메일 주소를 확인하거나 잠시 후 다시 시도해주세요." });
                 }
                 return res.status(201).json({ message: "인증 메일이 발송되었습니다." });
             });
         });
-    } catch (e) { res.status(500).json({ message: "서버 에러" }); }
+    } catch (e) {
+        res.status(500).json({ message: "서버 에러" });
+    }
 });
 
 
@@ -799,7 +806,12 @@ app.post("/api/login", (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(401).json({ message: "비밀번호가 틀렸습니다." });
 
-        const safeUser = { user_id: user.user_id, name: user.name, email: user.email };
+        const safeUser = {
+            user_id: user.user_id,
+            name: user.name,
+            email: user.email,
+            is_admin: !!user.is_admin,  
+        };
         const token = createToken(safeUser);
         return res.status(200).json({ token, user: safeUser });
     });
@@ -901,7 +913,7 @@ app.post("/api/lectures", requireAuth, lectureFileUpload.array("files", 10), (re
 });
 
 // 강의 수정
-app.put("/api/lectures/:id", lectureFileUpload.array("files", 10), requireAuth, (req, res) => {
+app.put("/api/lectures/:id", requireAuth, lectureFileUpload.array("files", 10), (req, res) => {
     const lectureId = req.params.id;
     const user_id = req.user.user_id;
     const { title, raw_text, summary_data } = req.body;
@@ -1161,11 +1173,9 @@ app.post("/api/transcribe", requireAuth, upload.single("audio"), async (req, res
             throw new Error("GROQ_API_KEY가 설정되지 않았습니다.");
         }
 
-        if (req.file.size < 4000) {
-            return res.status(200).json({ text: "" });
-        }
-
         const wavStat = fs.statSync(wavPath);
+        if (wavStat.size < 8000) return res.status(200).json({ text: "" });
+
         const userId = req.body.userId || req.query.userId || "default";
 
         const formData = new FormData();
@@ -1621,7 +1631,129 @@ ${text.slice(0, 8000)}
     }
 });
 
+// ─── 관리자 전용 미들웨어 ───────────────────────────────────────────
+function requireAdmin(req, res, next) {
+    const auth = req.headers.authorization || "";
+    const token = auth.split(" ")[1];
+    if (!token) return res.status(401).json({ message: "인증 필요" });
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (!decoded.is_admin) return res.status(403).json({ message: "관리자 권한이 필요합니다." });
+        req.user = decoded;
+        next();
+    } catch {
+        return res.status(401).json({ message: "토큰 오류" });
+    }
+}
 
+// ─── 전체 유저 목록 조회 ────────────────────────────────────────────
+app.get("/api/admin/users", requireAdmin, (req, res) => {
+    db.query(
+        "SELECT user_id, name, email, is_verified, is_admin, created_at FROM users ORDER BY created_at DESC",
+        (err, results) => {
+            if (err) return res.status(500).json({ message: "유저 목록 조회 실패" });
+            return res.status(200).json(results);
+        }
+    );
+});
+
+// ─── 유저 삭제 (연결 데이터 전체 삭제) ─────────────────────────────
+app.delete("/api/admin/users/:userId", requireAdmin, (req, res) => {
+    const targetId = req.params.userId;
+
+    if (String(targetId) === String(req.user.user_id)) {
+        return res.status(400).json({ message: "자기 자신은 삭제할 수 없습니다." });
+    }
+
+    const run = (sql, params) =>
+        new Promise((resolve, reject) =>
+            db.query(sql, params, (err, result) => (err ? reject(err) : resolve(result)))
+        );
+
+    (async () => {
+        // 1. 퀴즈 히스토리
+        await run("DELETE FROM quiz_history WHERE user_id = ?", [targetId]);
+        // 2. 강의
+        await run("DELETE FROM lectures WHERE user_id = ?", [targetId]);
+        // 3. 친구 관계
+        await run("DELETE FROM friends WHERE user_id = ? OR friend_id = ?", [targetId, targetId]);
+        // 4. 채팅 메시지 (보낸 메시지)
+        await run("DELETE FROM chat_messages WHERE sender_id = ?", [targetId]);
+        // 5. 채팅방 멤버
+        await run("DELETE FROM room_members WHERE user_id = ?", [targetId]);
+        // 6. 유저 삭제
+        const result = await run("DELETE FROM users WHERE user_id = ?", [targetId]);
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ message: "유저를 찾을 수 없습니다." });
+        }
+        return res.status(200).json({ message: "유저가 삭제되었습니다." });
+    })().catch((err) => {
+        console.error("유저 삭제 오류:", err);
+        return res.status(500).json({ message: "유저 삭제 중 오류가 발생했습니다." });
+    });
+});
+
+// ─── 유저 admin 권한 토글 ──────────────────────────────────────────
+app.patch("/api/admin/users/:userId/toggle-admin", requireAdmin, (req, res) => {
+    const targetId = req.params.userId;
+
+    if (String(targetId) === String(req.user.user_id)) {
+        return res.status(400).json({ message: "자기 자신의 권한은 변경할 수 없습니다." });
+    }
+
+    db.query("SELECT is_admin FROM users WHERE user_id = ?", [targetId], (err, rows) => {
+        if (err || rows.length === 0) return res.status(404).json({ message: "유저를 찾을 수 없습니다." });
+        const newVal = rows[0].is_admin ? 0 : 1;
+        db.query("UPDATE users SET is_admin = ? WHERE user_id = ?", [newVal, targetId], (err2) => {
+            if (err2) return res.status(500).json({ message: "권한 변경 실패" });
+            return res.status(200).json({ message: `관리자 권한 ${newVal ? "부여" : "해제"} 완료`, is_admin: newVal });
+        });
+    });
+});
+
+// ─── 전체 강의 목록 조회 ────────────────────────────────────────────
+app.get("/api/admin/lectures", requireAdmin, (req, res) => {
+    db.query(
+        `SELECT l.id, l.title, l.created_at, u.name AS user_name, u.email AS user_email
+         FROM lectures l
+         JOIN users u ON l.user_id = u.user_id
+         ORDER BY l.created_at DESC`,
+        (err, results) => {
+            if (err) return res.status(500).json({ message: "전체 강의 조회 실패" });
+            return res.status(200).json(results);
+        }
+    );
+});
+
+// ─── 강의 삭제 ─────────────────────────────────────────────────────
+app.delete("/api/admin/lectures/:lectureId", requireAdmin, (req, res) => {
+    const lectureId = req.params.lectureId;
+    db.query("DELETE FROM quiz_history WHERE lecture_id = ?", [lectureId], (e1) => {
+        if (e1) return res.status(500).json({ message: "퀴즈 히스토리 삭제 실패" });
+        db.query("DELETE FROM lectures WHERE id = ?", [lectureId], (e2, result) => {
+            if (e2) return res.status(500).json({ message: "강의 삭제 실패" });
+            if (result.affectedRows === 0) return res.status(404).json({ message: "강의를 찾을 수 없습니다." });
+            return res.status(200).json({ message: "강의가 삭제되었습니다." });
+        });
+    });
+});
+
+// ─── 전체 퀴즈 히스토리 조회 ────────────────────────────────────────
+app.get("/api/admin/quiz-history", requireAdmin, (req, res) => {
+    db.query(
+        `SELECT qh.id, qh.lecture_title, qh.score, qh.correct, qh.total, qh.created_at,
+                u.name AS user_name, u.email AS user_email
+         FROM quiz_history qh
+         JOIN users u ON qh.user_id = u.user_id
+         ORDER BY qh.created_at DESC
+         LIMIT 200`,
+        (err, results) => {
+            if (err) return res.status(500).json({ message: "퀴즈 히스토리 조회 실패" });
+            return res.status(200).json(results);
+        }
+    );
+});
 
 server.listen(PORT, () => {
     console.log(`✅ 서버 실행 중: ${PORT}`);
