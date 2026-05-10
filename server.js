@@ -11,6 +11,8 @@ const FormData = require("form-data");
 const fetch = require("node-fetch");
 const { execFile } = require("child_process");
 const jwt = require("jsonwebtoken");
+const pdfParse = require("pdf-parse");
+const AdmZip = require("adm-zip");
 const ffmpeg = require("fluent-ffmpeg"); // npm install fluent-ffmpeg
 const ffmpegPath = require("ffmpeg-static"); //npm install fluent-ffmpeg ffmpeg-static
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -33,6 +35,133 @@ const lectureFileStorage = multer.diskStorage({
 });
 
 const lectureFileUpload = multer({ storage: lectureFileStorage });
+function fixOriginalName(name) {
+    if (!name) return "첨부파일";
+
+    try {
+        return Buffer.from(name, "latin1").toString("utf8");
+    } catch {
+        return name;
+    }
+}
+
+function stripXmlTags(xml) {
+    return String(xml || "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function extractZipOfficeText(filePath, patterns) {
+    const zip = new AdmZip(filePath);
+    const entries = zip.getEntries();
+
+    return entries
+        .filter((entry) => patterns.some((pattern) => pattern.test(entry.entryName)))
+        .map((entry) => stripXmlTags(entry.getData().toString("utf8")))
+        .join("\n")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+async function extractImageTextWithOpenAI(filePath, mimetype) {
+    const imageBase64 = fs.readFileSync(filePath).toString("base64");
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        {
+                            type: "text",
+                            text: "이 이미지는 강의자료입니다. 이미지 안의 텍스트와 핵심 내용을 한국어로 자세히 추출해줘.",
+                        },
+                        {
+                            type: "image_url",
+                            image_url: {
+                                url: `data:${mimetype};base64,${imageBase64}`,
+                            },
+                        },
+                    ],
+                },
+            ],
+        }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.error?.message || "이미지 분석 실패");
+    }
+
+    return data.choices?.[0]?.message?.content || "";
+}
+
+async function extractLectureFileText(file) {
+    const filePath = file.path;
+    const originalName = fixOriginalName(file.originalname);
+    const ext = path.extname(originalName).toLowerCase();
+    const mimetype = file.mimetype || "";
+
+    try {
+        if (ext === ".pdf" || mimetype.includes("pdf")) {
+    const buffer = fs.readFileSync(filePath);
+    const parsed = await pdfParse(buffer);
+    const pdfText = String(parsed.text || "")
+        .replace(/\uFFFE/g, " ")
+        .replace(/[^\S\r\n]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    if (pdfText.length >= 80) {
+        return pdfText;
+    }
+
+    return "[PDF 텍스트 추출이 충분하지 않습니다. 이 PDF는 스캔본이거나 특수 폰트 PDF일 수 있습니다. 텍스트가 선택 가능한 PDF 또는 PPTX/DOCX로 변환해 업로드하면 더 정확합니다.]";
+}
+
+        if (ext === ".pptx") {
+            return extractZipOfficeText(filePath, [/^ppt\/slides\/slide\d+\.xml$/]);
+        }
+
+        if (ext === ".docx") {
+            return extractZipOfficeText(filePath, [/^word\/document\.xml$/]);
+        }
+
+        if (ext === ".hwpx") {
+            return extractZipOfficeText(filePath, [/^Contents\/section\d+\.xml$/]);
+        }
+
+        if ([".txt", ".md", ".csv"].includes(ext)) {
+            return fs.readFileSync(filePath, "utf8");
+        }
+
+        if (mimetype.startsWith("image/")) {
+            return await extractImageTextWithOpenAI(filePath, mimetype);
+        }
+
+        if (ext === ".hwp") {
+            return "[.hwp 파일은 바로 읽기 어렵습니다. 가능하면 .hwpx 또는 PDF로 변환해서 업로드해주세요.]";
+        }
+
+        return "";
+    } catch (err) {
+        console.error(`${originalName} 내용 추출 실패:`, err);
+        return "";
+    }
+}
 
 if (!fs.existsSync("uploads_tmp/")) fs.mkdirSync("uploads_tmp/", { recursive: true });
 const storage = multer.diskStorage({
@@ -477,6 +606,278 @@ app.get("/api/friends/requests/sent/:userId", requireAuth, (req, res) => {
     });
 });
 
+// 단체 채팅방 나가기 (멤버에서 삭제)
+app.delete("/api/chat/rooms/leave", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const { roomId } = req.body;
+
+    if (!roomId) return res.status(400).json({ message: "roomId가 필요합니다." });
+
+    // 1. 해당 방의 멤버에서 나를 삭제
+    db.query(
+        "DELETE FROM room_members WHERE room_id = ? AND user_id = ?",
+        [roomId, userId],
+        (err, result) => {
+            if (err) {
+                console.error("방 나가기 DB 에러:", err);
+                return res.status(500).json({ message: "방 나가기 실패" });
+            }
+
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ message: "해당 방의 멤버가 아니거나 방을 찾을 수 없습니다." });
+            }
+
+            // 2. 방에 남은 멤버가 있는지 확인 (선택 사항: 멤버가 0명이면 방 자체를 삭제 가능)
+            db.query("SELECT COUNT(*) as count FROM room_members WHERE room_id = ?", [roomId], (countErr, countRows) => {
+                if (!countErr && countRows[0].count === 0) {
+                    // 메시지와 방 정보 삭제
+                    db.query("DELETE FROM chat_messages WHERE room_id = ?", [roomId]);
+                    db.query("DELETE FROM chat_rooms WHERE room_id = ?", [roomId]);
+                }
+            });
+
+            return res.status(200).json({ message: "채팅방에서 성공적으로 나갔습니다." });
+        }
+    );
+});
+
+// 사용자의 폴더 목록 조회
+app.get("/api/folders", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+
+    const sql = `
+        SELECT 
+            f.id,
+            f.name,
+            COUNT(l.id) AS lecture_count
+        FROM folders f
+        LEFT JOIN lectures l
+            ON l.user_id = f.user_id
+           AND l.folder_name = f.name
+        WHERE f.user_id = ?
+        GROUP BY f.id, f.name
+        ORDER BY f.name ASC
+    `;
+
+    db.query(sql, [userId], (err, results) => {
+        if (err) {
+            console.error("폴더 조회 실패:", err);
+            return res.status(500).json({ message: "폴더 조회 실패" });
+        }
+
+        return res.status(200).json(results);
+    });
+});
+
+// 새 폴더 생성
+app.post("/api/folders", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const name = String(req.body.name || "").trim();
+
+    if (!name) {
+        return res.status(400).json({ message: "폴더 이름이 필요합니다." });
+    }
+
+    const sql = `
+        INSERT INTO folders (user_id, name)
+        VALUES (?, ?)
+    `;
+
+    db.query(sql, [userId, name], (err, result) => {
+        if (err) {
+            if (err.code === "ER_DUP_ENTRY") {
+                return res.status(409).json({ message: "이미 같은 이름의 폴더가 있습니다." });
+            }
+
+            console.error("폴더 생성 실패:", err);
+            return res.status(500).json({ message: "폴더 생성 실패" });
+        }
+
+        return res.status(201).json({
+            id: result.insertId,
+            name,
+            lecture_count: 0,
+        });
+    });
+});
+
+// 폴더 이름 수정
+app.patch("/api/folders/:folderId", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const folderId = req.params.folderId;
+    const newName = String(req.body.name || "").trim();
+
+    if (!newName) {
+        return res.status(400).json({ message: "새 폴더 이름이 필요합니다." });
+    }
+
+    db.query(
+        "SELECT id, name FROM folders WHERE id = ? AND user_id = ? LIMIT 1",
+        [folderId, userId],
+        (findErr, rows) => {
+            if (findErr) {
+                console.error("폴더 조회 실패:", findErr);
+                return res.status(500).json({ message: "폴더 조회 실패" });
+            }
+
+            if (rows.length === 0) {
+                return res.status(404).json({ message: "폴더를 찾을 수 없습니다." });
+            }
+
+            const oldName = rows[0].name;
+
+            db.query(
+                "SELECT id FROM folders WHERE user_id = ? AND name = ? AND id != ? LIMIT 1",
+                [userId, newName, folderId],
+                (dupErr, dupRows) => {
+                    if (dupErr) {
+                        console.error("폴더 중복 확인 실패:", dupErr);
+                        return res.status(500).json({ message: "폴더 중복 확인 실패" });
+                    }
+
+                    if (dupRows.length > 0) {
+                        return res.status(409).json({ message: "이미 같은 이름의 폴더가 있습니다." });
+                    }
+
+                    db.query(
+                        "UPDATE folders SET name = ? WHERE id = ? AND user_id = ?",
+                        [newName, folderId, userId],
+                        (updateErr) => {
+                            if (updateErr) {
+                                console.error("폴더 이름 수정 실패:", updateErr);
+                                return res.status(500).json({ message: "폴더 이름 수정 실패" });
+                            }
+
+                            db.query(
+                                "UPDATE lectures SET folder_name = ? WHERE user_id = ? AND folder_name = ?",
+                                [newName, userId, oldName],
+                                (lectureErr) => {
+                                    if (lectureErr) {
+                                        console.error("강의 폴더명 동기화 실패:", lectureErr);
+                                        return res.status(500).json({ message: "강의 폴더명 동기화 실패" });
+                                    }
+
+                                    return res.status(200).json({
+                                        message: "폴더 이름이 수정되었습니다.",
+                                        id: Number(folderId),
+                                        oldName,
+                                        name: newName,
+                                    });
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        }
+    );
+});
+
+// 폴더 삭제
+app.delete("/api/folders/:folderId", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const folderId = req.params.folderId;
+
+    db.query(
+        "SELECT id, name FROM folders WHERE id = ? AND user_id = ? LIMIT 1",
+        [folderId, userId],
+        (findErr, rows) => {
+            if (findErr) {
+                console.error("폴더 조회 실패:", findErr);
+                return res.status(500).json({ message: "폴더 조회 실패" });
+            }
+
+            if (rows.length === 0) {
+                return res.status(404).json({ message: "폴더를 찾을 수 없습니다." });
+            }
+
+            const folderName = rows[0].name;
+
+            // 폴더 삭제 시 강의 자체는 삭제하지 않고, 폴더 연결만 해제
+            db.query(
+                "UPDATE lectures SET folder_name = NULL WHERE user_id = ? AND folder_name = ?",
+                [userId, folderName],
+                (lectureErr) => {
+                    if (lectureErr) {
+                        console.error("강의 폴더 연결 해제 실패:", lectureErr);
+                        return res.status(500).json({ message: "강의 폴더 연결 해제 실패" });
+                    }
+
+                    db.query(
+                        "DELETE FROM folders WHERE id = ? AND user_id = ?",
+                        [folderId, userId],
+                        (deleteErr) => {
+                            if (deleteErr) {
+                                console.error("폴더 삭제 실패:", deleteErr);
+                                return res.status(500).json({ message: "폴더 삭제 실패" });
+                            }
+
+                            return res.status(200).json({
+                                message: "폴더가 삭제되었습니다.",
+                                deletedFolderName: folderName,
+                            });
+                        }
+                    );
+                }
+            );
+        }
+    );
+});
+
+// 강의를 폴더에 넣기 또는 폴더에서 빼기
+app.put("/api/lectures/:lectureId/folder", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const lectureId = req.params.lectureId;
+
+    // 폴더 선택은 필수가 아님. 빈 값이면 폴더 없음으로 저장.
+    const folderName = req.body.folderName ? String(req.body.folderName).trim() : null;
+
+    const updateLectureFolder = () => {
+        db.query(
+            "UPDATE lectures SET folder_name = ? WHERE id = ? AND user_id = ?",
+            [folderName || null, lectureId, userId],
+            (err, result) => {
+                if (err) {
+                    console.error("강의 폴더 변경 실패:", err);
+                    return res.status(500).json({ message: "강의 폴더 변경 실패" });
+                }
+
+                if (result.affectedRows === 0) {
+                    return res.status(404).json({ message: "강의를 찾을 수 없습니다." });
+                }
+
+                return res.status(200).json({
+                    message: folderName ? "강의를 폴더에 넣었습니다." : "강의를 폴더에서 뺐습니다.",
+                    folderName,
+                });
+            }
+        );
+    };
+
+    // 폴더 선택 안 함이면 그냥 null 저장
+    if (!folderName) {
+        return updateLectureFolder();
+    }
+
+    // 폴더 선택했으면 내 폴더인지 확인
+    db.query(
+        "SELECT id FROM folders WHERE user_id = ? AND name = ? LIMIT 1",
+        [userId, folderName],
+        (folderErr, folderRows) => {
+            if (folderErr) {
+                console.error("폴더 확인 실패:", folderErr);
+                return res.status(500).json({ message: "폴더 확인 실패" });
+            }
+
+            if (folderRows.length === 0) {
+                return res.status(404).json({ message: "존재하지 않는 폴더입니다." });
+            }
+
+            updateLectureFolder();
+        }
+    );
+});
+
 // 받은 친구 요청 목록
 app.get("/api/friends/requests/:userId", requireAuth, (req, res) => {
     const userId = req.user.user_id;
@@ -724,52 +1125,121 @@ const gmailTransporter = nodemailer.createTransport({
     }
 });
 
-// 1. 회원가입 API (네이버 메일 발송 로직 포함)
+//1. 회원가입 api
 app.post("/api/signup", async (req, res) => {
     const { name, email, password } = req.body;
-    try {
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const verificationToken = crypto.randomBytes(32).toString('hex');
-        const verifyUrl = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/verify-email?token=${verificationToken}`;
 
-        const sql = `INSERT INTO users (name, email, password, verification_token, is_verified) VALUES (?, ?, ?, ?, false)`;
-        db.query(sql, [name, email, hashedPassword, verificationToken], (err) => {
-            if (err) return res.status(400).json({ message: "이미 사용 중인 이메일입니다." });
+    const cleanName = String(name || "").trim();
+    const cleanEmail = String(email || "").trim();
+    const cleanPassword = String(password || "");
+
+    if (!cleanName || !cleanEmail || !cleanPassword) {
+        return res.status(400).json({ message: "이름, 이메일, 비밀번호를 입력해주세요." });
+    }
+
+    try {
+        const hashedPassword = await bcrypt.hash(cleanPassword, 10);
+        const verificationToken = crypto.randomBytes(32).toString("hex");
+        const verifyUrl = `${process.env.BACKEND_URL || "http://localhost:5000"}/api/verify-email?token=${verificationToken}`;
+
+        const sendVerificationMail = () => {
+            const transporter = gmailTransporter;
 
             const mailOptions = {
-                from: `Lecture AI <${process.env.NAVER_USER}>`,
-                to: email,
-                subject: '[Lecture AI] 회원가입 완료를 위해 이메일 인증을 진행해주세요',
+                from: `Lecture AI <${process.env.GMAIL_USER}>`,
+                to: cleanEmail,
+                subject: "[Lecture AI] 이메일 인증을 완료해주세요",
                 html: `
-          <div style="background: #f9fafb; padding: 40px; font-family: sans-serif;">
-            <div style="max-width: 500px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; border: 1px solid #eee;">
-              <h2 style="color: #2383e2;">안녕하세요, ${name}님! 👋</h2>
-              <p>Lecture AI에 가입해주셔서 감사합니다. 아래 버튼을 눌러 인증을 완료해주세요.</p>
-              <a href="${verifyUrl}" style="display: inline-block; padding: 12px 24px; background: #2383e2; color: white; text-decoration: none; border-radius: 8px; font-weight: bold; margin: 20px 0;">이메일 인증하기</a>
-              <p style="font-size: 12px; color: #999;">인증 완료 전까지는 로그인이 불가능합니다.</p>
-            </div>
-          </div>
-        `
+                    <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
+                        <div style="max-width:500px;margin:0 auto;background:white;padding:24px;border-radius:12px;border:1px solid #eee;">
+                            <h2 style="color:#2383e2;">Lecture AI 이메일 인증</h2>
+                            <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
+                            <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 18px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;">
+                                이메일 인증하기
+                            </a>
+                            <p style="margin-top:20px;color:#666;font-size:13px;">
+                                버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
+                                ${verifyUrl}
+                            </p>
+                        </div>
+                    </div>
+                `,
             };
-
-            const transporter = email.includes("naver.com") ? naverTransporter : gmailTransporter;
-            const fromUser = email.includes("naver.com") ? process.env.NAVER_USER : process.env.GMAIL_USER;
-            mailOptions.from = `Lecture AI <${fromUser}>`;
 
             transporter.sendMail(mailOptions, (mailErr) => {
                 if (mailErr) {
                     console.error("메일 발송 실패:", mailErr);
-                    // ✅ 메일 실패 시 삽입한 유저 롤백
-                    db.query("DELETE FROM users WHERE email = ?", [email], (delErr) => {
-                        if (delErr) console.error("유저 롤백 실패:", delErr);
+                    return res.status(500).json({
+                        message: "메일 발송에 실패했습니다. 백엔드 터미널의 메일 발송 실패 로그를 확인해주세요.",
                     });
-                    return res.status(500).json({ message: "메일 발송에 실패했습니다. 이메일 주소를 확인하거나 잠시 후 다시 시도해주세요." });
                 }
-                return res.status(201).json({ message: "인증 메일이 발송되었습니다." });
+
+                return res.status(200).json({
+                    message: "📩 인증 메일이 발송되었습니다! 메일함을 확인해주세요.",
+                });
             });
-        });
-    } catch (e) {
-        res.status(500).json({ message: "서버 에러" });
+        };
+
+        db.query(
+            "SELECT user_id, is_verified FROM users WHERE email = ? LIMIT 1",
+            [cleanEmail],
+            (findErr, rows) => {
+                if (findErr) {
+                    console.error("회원 조회 실패:", findErr);
+                    return res.status(500).json({ message: "회원 조회 실패" });
+                }
+
+                if (rows.length > 0) {
+                    const existingUser = rows[0];
+
+                    if (existingUser.is_verified) {
+                        return res.status(400).json({ message: "이미 사용 중인 이메일입니다." });
+                    }
+
+                    db.query(
+                        `
+                        UPDATE users
+                        SET name = ?,
+                            password = ?,
+                            verification_token = ?,
+                            is_verified = false
+                        WHERE email = ?
+                        `,
+                        [cleanName, hashedPassword, verificationToken, cleanEmail],
+                        (updateErr) => {
+                            if (updateErr) {
+                                console.error("미인증 계정 갱신 실패:", updateErr);
+                                return res.status(500).json({ message: "회원가입 정보 갱신 실패" });
+                            }
+
+                            sendVerificationMail();
+                        }
+                    );
+
+                    return;
+                }
+
+                db.query(
+                    `
+                    INSERT INTO users
+                        (name, email, password, verification_token, is_verified)
+                    VALUES (?, ?, ?, ?, false)
+                    `,
+                    [cleanName, cleanEmail, hashedPassword, verificationToken],
+                    (insertErr) => {
+                        if (insertErr) {
+                            console.error("회원가입 DB 저장 실패:", insertErr);
+                            return res.status(400).json({ message: "회원가입 실패" });
+                        }
+
+                        sendVerificationMail();
+                    }
+                );
+            }
+        );
+    } catch (err) {
+        console.error("회원가입 처리 실패:", err);
+        return res.status(500).json({ message: "회원가입 처리 중 오류가 발생했습니다." });
     }
 });
 
@@ -867,8 +1337,11 @@ app.post("/api/lectures", requireAuth, lectureFileUpload.array("files", 10), (re
     const user_id = req.user.user_id;
     const { title, raw_text, summary_data } = req.body;
 
+    // 폴더 선택은 필수가 아님
+    const folderName = req.body.folderName ? String(req.body.folderName).trim() : null;
+
     const files = (req.files || []).map((file) => ({
-        originalName: file.originalname,
+        originalName: fixOriginalName(file.originalname),
         filename: file.filename,
         path: `/lecture_uploads/${file.filename}`,
         mimetype: file.mimetype,
@@ -893,21 +1366,50 @@ app.post("/api/lectures", requireAuth, lectureFileUpload.array("files", 10), (re
         files,
     };
 
-    const sql = `INSERT INTO lectures (user_id, title, raw_text, summary_data) VALUES (?, ?, ?, ?)`;
+    const saveLecture = () => {
+        const sql = `
+            INSERT INTO lectures 
+                (user_id, title, raw_text, summary_data, folder_name) 
+            VALUES (?, ?, ?, ?, ?)
+        `;
 
+        db.query(
+            sql,
+            [user_id, title, raw_text, JSON.stringify(fullSummaryData), folderName || null],
+            (err, result) => {
+                if (err) {
+                    console.error("DB 저장 에러:", err);
+                    return res.status(500).json({ message: "강의 저장 실패" });
+                }
+
+                return res.status(201).json({
+                    message: "강의가 DB에 안전하게 저장되었습니다!",
+                    id: result.insertId,
+                });
+            }
+        );
+    };
+
+    // 폴더를 선택하지 않았으면 바로 저장
+    if (!folderName) {
+        return saveLecture();
+    }
+
+    // 폴더를 선택했으면 내 폴더인지 확인 후 저장
     db.query(
-        sql,
-        [user_id, title, raw_text, JSON.stringify(fullSummaryData)],
-        (err, result) => {
-            if (err) {
-                console.error("DB 저장 에러:", err);
-                return res.status(500).json({ message: "강의 저장 실패" });
+        "SELECT id FROM folders WHERE user_id = ? AND name = ? LIMIT 1",
+        [user_id, folderName],
+        (folderErr, folderRows) => {
+            if (folderErr) {
+                console.error("폴더 확인 실패:", folderErr);
+                return res.status(500).json({ message: "폴더 확인 실패" });
             }
 
-            return res.status(201).json({
-                message: "강의가 DB에 안전하게 저장되었습니다!",
-                id: result.insertId,
-            });
+            if (folderRows.length === 0) {
+                return res.status(404).json({ message: "존재하지 않는 폴더입니다." });
+            }
+
+            saveLecture();
         }
     );
 });
@@ -933,7 +1435,7 @@ app.put("/api/lectures/:id", requireAuth, lectureFileUpload.array("files", 10), 
     }
 
     const uploadedFiles = (req.files || []).map((file) => ({
-        originalName: file.originalname,
+        originalName: fixOriginalName(file.originalname),
         filename: file.filename,
         path: `/lecture_uploads/${file.filename}`,
         mimetype: file.mimetype,
@@ -1333,9 +1835,45 @@ app.post("/api/grade", requireAuth, async (req, res) => {
 });
 
 // 요약 / 키워드 / 퀴즈 - GPT
-app.post("/api/summarize", requireAuth, async (req, res) => {
-    const { text, quizCount = 3, quizDifficulty = "보통", quizTypes = ["short"] } = req.body;
-    if (!text?.trim()) return res.status(400).json({ message: "텍스트가 없습니다." });
+app.post("/api/summarize", requireAuth, lectureFileUpload.array("files", 10), async (req, res) => {
+    const { text = "", quizCount = 3, quizDifficulty = "보통" } = req.body;
+
+    let quizTypes = req.body.quizTypes || ["short"];
+    if (typeof quizTypes === "string") {
+        try {
+            quizTypes = JSON.parse(quizTypes);
+        } catch {
+            quizTypes = [quizTypes];
+        }
+    }
+    if (!Array.isArray(quizTypes)) quizTypes = ["short"];
+
+    const extractedParts = [];
+
+    for (const file of req.files || []) {
+        const originalName = fixOriginalName(file.originalname);
+        const extractedText = await extractLectureFileText(file);
+
+        if (String(extractedText || "").trim()) {
+            extractedParts.push(`파일명: ${originalName}\n${extractedText}`);
+        }
+
+        // 요약용 임시 업로드 파일은 저장하지 않고 삭제
+        fs.unlink(file.path, () => {});
+    }
+
+    const combinedText = [
+        String(text || "").trim() ? `사용자 입력 내용:\n${String(text || "").trim()}` : "",
+        extractedParts.length > 0
+            ? `첨부파일에서 추출한 내용:\n${extractedParts.join("\n\n")}`
+            : "",
+    ]
+        .filter(Boolean)
+        .join("\n\n");
+
+    if (!combinedText.trim()) {
+        return res.status(400).json({ message: "요약할 텍스트나 파일 내용이 없습니다." });
+    }
 
     // 난이도별 프롬프트 지시
     const difficultyGuide = {
@@ -1368,7 +1906,28 @@ app.post("/api/summarize", requireAuth, async (req, res) => {
 
 설명 문장 절대 쓰지 말고 JSON만 반환해.
 
+먼저 강의 내용을 보고 과목 유형을 자동 분류해라.
+
+subjectType은 아래 중 하나로 고른다:
+- "computer_science": 프로그래밍, 알고리즘, 데이터베이스, 네트워크, 운영체제, 소프트웨어 관련
+- "math": 수학, 통계, 공식, 증명, 계산, 풀이 중심
+- "science": 물리, 화학, 생명, 지구과학, 실험/원리 중심
+- "language": 영어, 외국어, 문법, 어휘, 독해 중심
+- "humanities": 문학, 역사, 철학, 사회, 교육, 인문/사회 이론 중심
+- "business": 경영, 경제, 회계, 마케팅, 재무 중심
+- "general": 위 유형에 명확히 속하지 않는 일반 강의
+
+analysisTitle은 사용자가 바로 이해할 수 있는 분석 제목으로 작성해라.
+
 중요:
+- 단순 요약만 하지 마라.
+- 강의 유형에 맞는 학습 자료를 만들어라.
+- computer_science이면 코드, 문법, 실행 흐름, 오류 포인트, 시험 포인트를 중심으로 분석해라.
+- math이면 공식, 기호 의미, 풀이 단계, 자주 나오는 문제 유형을 중심으로 분석해라.
+- science이면 핵심 원리, 과정, 변수 관계, 실험/현상 해석을 중심으로 분석해라.
+- language이면 핵심 표현, 단어, 문법, 해석, 예문을 중심으로 분석해라.
+- humanities이면 개념, 주장, 배경, 비교, 사례를 중심으로 분석해라.
+- business이면 핵심 개념, 지표, 계산식, 사례, 의사결정 포인트를 중심으로 분석해라.
 - keywords 배열에는 실제 핵심 키워드만 넣어라.
 - keywordExplanations의 key는 반드시 keywords 배열에 들어간 실제 키워드 문자열과 완전히 같아야 한다.
 - "키워드1", "키워드2" 같은 임시 이름은 절대 사용하지 마라.
@@ -1379,6 +1938,75 @@ app.post("/api/summarize", requireAuth, async (req, res) => {
 - 유형: ${typeInstruction}
 - 객관식(mcq) 보기는 반드시 4개, 정답은 보기 중 하나와 정확히 일치해야 함
 - OX 문제 정답은 반드시 "O" 또는 "X" 중 하나
+
+quiz 배열 규칙:
+
+- 단답형 문제 type은 반드시 "short"
+- 객관식 문제 type은 반드시 "mcq"
+- OX 문제 type은 반드시 "ox"
+
+객관식 문제는 반드시 아래 형식 사용:
+
+{
+  "type": "mcq",
+  "question": "...",
+  "choices": ["1", "2", "3", "4"],
+  "answer": "..."
+}
+
+절대로 "options", "보기", "선택지", "객관식", "주관식" 같은 다른 키나 타입명을 사용하지 마라.
+응답 JSON 형식:
+{
+  "subjectType": "computer_science",
+  "analysisTitle": "자바 상속과 다형성 핵심 학습",
+  "summary": "강의 전체 핵심을 4~7문장으로 정리",
+  "keywords": ["키워드1", "키워드2", "키워드3"],
+  "keywordExplanations": {
+    "키워드1": "쉬운 설명",
+    "키워드2": "쉬운 설명",
+    "키워드3": "쉬운 설명"
+  },
+  "studyGuide": {
+    "coreConcepts": [
+      {
+        "title": "핵심 개념명",
+        "explanation": "개념 설명",
+        "whyImportant": "왜 중요한지"
+      }
+    ],
+    "codeHighlights": [
+      {
+        "code": "중요 코드 또는 문법",
+        "explanation": "코드 의미",
+        "flow": "실행 흐름 또는 사용 상황"
+      }
+    ],
+    "formulas": [
+      {
+        "formula": "공식 또는 기호",
+        "meaning": "의미",
+        "useCase": "언제 쓰는지"
+      }
+    ],
+    "problemSolvingSteps": [
+      "풀이/학습 단계 1",
+      "풀이/학습 단계 2"
+    ],
+    "examPoints": [
+      "시험에 나올 핵심 포인트"
+    ],
+    "commonMistakes": [
+      "자주 틀리는 부분"
+    ],
+    "practiceTasks": [
+      "직접 해볼 실습 또는 연습"
+    ]
+  },
+  "quiz": [
+    ${typeExamples.join(",\n    ")}
+  ]
+}
+
 
 예시 구조:
 {
@@ -1399,12 +2027,16 @@ app.post("/api/summarize", requireAuth, async (req, res) => {
 - keywordExplanations는 반드시 포함
 - keywordExplanations의 key는 keywords 배열과 완전히 동일해야 함
 - keywords의 모든 항목에 대해 설명 생성 (1:1 대응)
+- 해당 과목 유형과 관련 없는 배열은 빈 배열 []로 둔다.
+  예: 수학 강의면 codeHighlights는 [], 컴공 강의면 formulas는 필요한 경우만 채운다.
+- computer_science 강의에서 코드가 나오면 codeHighlights를 반드시 채운다.
+- math 강의에서 공식이 나오면 formulas와 problemSolvingSteps를 반드시 채운다.
 - 하나라도 빠지면 안 됨
 - 설명은 쉬운 한국어로 작성
 - 강의 맥락 기반 설명
 
 강의 내용:
-${text.slice(0, 8000)}
+${combinedText.slice(0, 24000)}
 `;
 
         const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -1439,7 +2071,11 @@ ${text.slice(0, 8000)}
 
         const parsed = JSON.parse(match[0]);
 
-        return res.status(200).json(parsed);
+        return res.status(200).json({
+            ...parsed,
+            extractedText: combinedText.slice(0, 12000),
+        });
+
     } catch (err) {
         console.error("요약 오류:", err);
         return res.status(500).json({ message: err.message || "요약 오류" });
