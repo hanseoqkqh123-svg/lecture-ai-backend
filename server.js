@@ -2492,6 +2492,81 @@ app.get("/api/admin/quiz-history", requireAdmin, (req, res) => {
     );
 });
 
+// ─── AI 질문 채팅 ────────────────────────────────────────────────────
+app.post("/api/ai-chat", requireAuth, async (req, res) => {
+    const { messages, lectureContext } = req.body;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({ message: "메시지가 없습니다." });
+    }
+
+    const recentMessages = messages
+        .slice(-20)
+        .map((m) => ({
+            role: m.role === "assistant" ? "assistant" : "user",
+            content: String(m.content || "").trim(),
+        }))
+        .filter((m) => m.content);
+
+    const systemPrompt = lectureContext
+        ? `당신은 Lecture AI의 학습 도우미입니다.
+
+아래 강의 내용을 참고해서 학생의 질문에 답변하세요.
+
+답변 규칙:
+- 한국어로 답변
+- 너무 딱딱하지 않게 설명
+- 강의 내용과 관련 있으면 강의 내용을 우선 참고
+- 학생이 이해하기 쉽게 예시를 들어 설명
+- 모르면 지어내지 말고 확인이 필요하다고 말하기
+
+[강의 내용]
+${String(lectureContext).slice(0, 6000)}`
+        : `당신은 Lecture AI의 학습 도우미입니다.
+
+답변 규칙:
+- 한국어로 답변
+- 학생이 이해하기 쉽게 설명
+- 필요하면 예시를 들어 설명
+- 모르면 지어내지 말고 확인이 필요하다고 말하기`;
+
+    try {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    ...recentMessages,
+                ],
+                max_tokens: 1000,
+                temperature: 0.7,
+            }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error?.message || "GPT 응답 실패");
+        }
+
+        const answer =
+            data.choices?.[0]?.message?.content?.trim() ||
+            "답변을 생성할 수 없었습니다.";
+
+        return res.status(200).json({ answer });
+    } catch (err) {
+        console.error("AI 채팅 오류:", err);
+        return res.status(500).json({
+            message: err.message || "AI 채팅 오류",
+        });
+    }
+});
+
 server.listen(PORT, () => {
     console.log(`✅ 서버 실행 중: ${PORT}`);
 });
