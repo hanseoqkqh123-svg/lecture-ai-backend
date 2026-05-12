@@ -16,14 +16,6 @@ const AdmZip = require("adm-zip");
 const ffmpeg = require("fluent-ffmpeg"); // npm install fluent-ffmpeg
 const ffmpegPath = require("ffmpeg-static"); //npm install fluent-ffmpeg ffmpeg-static
 require("dotenv").config();
-const brevo = require("@getbrevo/brevo");
-
-const brevoApi = new brevo.TransactionalEmailsApi();
-brevoApi.setApiKey(
-    brevo.TransactionalEmailsApiApiKeys.apiKey,
-    process.env.BREVO_API_KEY
-);
-
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const lectureUploadDir = "lecture_uploads/";
@@ -1161,42 +1153,54 @@ app.post("/api/signup", async (req, res) => {
 
         const sendVerificationMail = async () => {
             try {
-                await brevoApi.sendTransacEmail({
-                    sender: {
-                        name: process.env.BREVO_SENDER_NAME || "Lecture AI",
-                        email: process.env.BREVO_SENDER_EMAIL,
+                const brevoRes = await fetch("https://api.brevo.com/v3/smtp/email", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "api-key": process.env.BREVO_API_KEY,
                     },
-                    to: [
-                        {
-                            email: cleanEmail,
-                            name: cleanName,
+                    body: JSON.stringify({
+                        sender: {
+                            name: process.env.BREVO_SENDER_NAME || "Lecture AI",
+                            email: process.env.BREVO_SENDER_EMAIL,
                         },
-                    ],
-                    subject: "[Lecture AI] 이메일 인증",
-                    htmlContent: `
-                <div style="padding:40px;font-family:sans-serif;">
-                    <h2>Lecture AI 이메일 인증</h2>
-                    <p>아래 버튼을 눌러 인증해주세요.</p>
-                    <a href="${verifyUrl}"
-                       style="display:inline-block;padding:12px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:8px;">
-                        이메일 인증하기
-                    </a>
-                    <p style="margin-top:20px;color:#666;font-size:13px;">
-                        버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
-                        ${verifyUrl}
-                    </p>
-                </div>
-            `,
+                        to: [
+                            {
+                                email: cleanEmail,
+                                name: cleanName,
+                            },
+                        ],
+                        subject: "[Lecture AI] 이메일 인증",
+                        htmlContent: `
+                    <div style="padding:40px;font-family:sans-serif;">
+                        <h2>Lecture AI 이메일 인증</h2>
+                        <p>아래 버튼을 눌러 인증해주세요.</p>
+                        <a href="${verifyUrl}"
+                           style="display:inline-block;padding:12px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:8px;">
+                            이메일 인증하기
+                        </a>
+                        <p style="margin-top:20px;color:#666;font-size:13px;">
+                            버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
+                            ${verifyUrl}
+                        </p>
+                    </div>
+                `,
+                    }),
                 });
+
+                const resultText = await brevoRes.text();
+
+                if (!brevoRes.ok) {
+                    console.error("Brevo 메일 발송 실패:", resultText);
+                    return res.status(500).json({ message: "메일 발송 실패" });
+                }
 
                 return res.status(200).json({
                     message: "인증 메일이 발송되었습니다.",
                 });
             } catch (error) {
-                console.error("Brevo 메일 발송 실패:", error?.body || error);
-                return res.status(500).json({
-                    message: "메일 발송 실패",
-                });
+                console.error("Brevo 메일 발송 오류:", error);
+                return res.status(500).json({ message: "메일 발송 실패" });
             }
         };
 
