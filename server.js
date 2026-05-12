@@ -1118,11 +1118,16 @@ const naverTransporter = nodemailer.createTransport({
 
 // 2. 지메일 설정
 const gmailTransporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: "smtp.gmail.com",
+    port: 587,
+    secure: false,
     auth: {
         user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_PASS
-    }
+        pass: process.env.GMAIL_PASS,
+    },
+    tls: {
+        rejectUnauthorized: false,
+    },
 });
 
 //1. 회원가입 api
