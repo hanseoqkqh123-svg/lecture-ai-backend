@@ -15,9 +15,11 @@ const pdfParse = require("pdf-parse");
 const AdmZip = require("adm-zip");
 const ffmpeg = require("fluent-ffmpeg"); // npm install fluent-ffmpeg
 const ffmpegPath = require("ffmpeg-static"); //npm install fluent-ffmpeg ffmpeg-static
-ffmpeg.setFfmpegPath(ffmpegPath);
-
 require("dotenv").config();
+
+const { Resend } = require("resend");
+const resend = new Resend(process.env.RESEND_API_KEY);
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const lectureUploadDir = "lecture_uploads/";
 if (!fs.existsSync(lectureUploadDir)) {
@@ -117,20 +119,20 @@ async function extractLectureFileText(file) {
 
     try {
         if (ext === ".pdf" || mimetype.includes("pdf")) {
-    const buffer = fs.readFileSync(filePath);
-    const parsed = await pdfParse(buffer);
-    const pdfText = String(parsed.text || "")
-        .replace(/\uFFFE/g, " ")
-        .replace(/[^\S\r\n]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+            const buffer = fs.readFileSync(filePath);
+            const parsed = await pdfParse(buffer);
+            const pdfText = String(parsed.text || "")
+                .replace(/\uFFFE/g, " ")
+                .replace(/[^\S\r\n]+/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
 
-    if (pdfText.length >= 80) {
-        return pdfText;
-    }
+            if (pdfText.length >= 80) {
+                return pdfText;
+            }
 
-    return "[PDF 텍스트 추출이 충분하지 않습니다. 이 PDF는 스캔본이거나 특수 폰트 PDF일 수 있습니다. 텍스트가 선택 가능한 PDF 또는 PPTX/DOCX로 변환해 업로드하면 더 정확합니다.]";
-}
+            return "[PDF 텍스트 추출이 충분하지 않습니다. 이 PDF는 스캔본이거나 특수 폰트 PDF일 수 있습니다. 텍스트가 선택 가능한 PDF 또는 PPTX/DOCX로 변환해 업로드하면 더 정확합니다.]";
+        }
 
         if (ext === ".pptx") {
             return extractZipOfficeText(filePath, [/^ppt\/slides\/slide\d+\.xml$/]);
@@ -1105,31 +1107,33 @@ app.get("/api/chat/messages/:roomId", requireAuth, (req, res) => {
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
-// 1. 네이버 메일 전송 설정
-const naverTransporter = nodemailer.createTransport({
-    host: "smtp.naver.com",
-    port: 465,
-    secure: true, // SSL 사용
-    auth: {
-        user: process.env.NAVER_USER, // 네이버 아이디 (예: abc@naver.com)
-        pass: process.env.NAVER_PASS  // 네이버 앱 비밀번호
-    }
-});
+
+//Render 에서 오류뜨면서 안돼서 잠시꺼둠
+// 1. 네이버 메일 전송 설정 
+// const naverTransporter = nodemailer.createTransport({
+//  host: "smtp.naver.com",
+// port: 465,
+// secure: true, // SSL 사용
+// auth: {
+// user: process.env.NAVER_USER, // 네이버 아이디 (예: abc@naver.com)
+// pass: process.env.NAVER_PASS  // 네이버 앱 비밀번호
+// }
+// });
 
 // 2. 지메일 설정
-const gmailTransporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 587,
-    secure: false,
-    family: 4,
-    auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_PASS,
-    },
-    tls: {
-        rejectUnauthorized: false,
-    },
-});
+//const gmailTransporter = nodemailer.createTransport({
+// host: "smtp.gmail.com",
+//port: 587,
+//secure: false,
+//family: 4,
+//auth: {
+//user: process.env.GMAIL_USER,
+//pass: process.env.GMAIL_PASS,
+//},
+//tls: {
+//  rejectUnauthorized: false,
+//},
+//});
 console.log("GMAIL_USER:", process.env.GMAIL_USER);
 console.log("GMAIL_PASS EXISTS:", !!process.env.GMAIL_PASS);
 
@@ -1150,44 +1154,99 @@ app.post("/api/signup", async (req, res) => {
         const verificationToken = crypto.randomBytes(32).toString("hex");
         const verifyUrl = `${process.env.BACKEND_URL || "http://localhost:5000"}/api/verify-email?token=${verificationToken}`;
 
-        const sendVerificationMail = () => {
-            const transporter = gmailTransporter;
-
-            const mailOptions = {
-                from: `Lecture AI <${process.env.GMAIL_USER}>`,
-                to: cleanEmail,
-                subject: "[Lecture AI] 이메일 인증을 완료해주세요",
-                html: `
-                    <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
-                        <div style="max-width:500px;margin:0 auto;background:white;padding:24px;border-radius:12px;border:1px solid #eee;">
-                            <h2 style="color:#2383e2;">Lecture AI 이메일 인증</h2>
-                            <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
-                            <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 18px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;">
-                                이메일 인증하기
-                            </a>
-                            <p style="margin-top:20px;color:#666;font-size:13px;">
-                                버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
-                                ${verifyUrl}
-                            </p>
-                        </div>
-                    </div>
-                `,
-            };
-
-            transporter.sendMail(mailOptions, (mailErr) => {
-                if (mailErr) {
-                    console.error("메일 발송 실패:", mailErr);
-                    return res.status(500).json({
-                        message: "메일 발송에 실패했습니다. 백엔드 터미널의 메일 발송 실패 로그를 확인해주세요.",
-                    });
-                }
+        const sendVerificationMail = async () => {
+            try {
+                await resend.emails.send({
+                    from: process.env.EMAIL_FROM,
+                    to: cleanEmail,
+                    subject: "[Lecture AI] 이메일 인증",
+                    html: `
+                <div style="padding:40px;font-family:sans-serif;">
+                    <h2>Lecture AI 이메일 인증</h2>
+                    <p>아래 버튼을 눌러 인증해주세요.</p>
+                    <a href="${verifyUrl}">이메일 인증하기</a>
+                    <p>${verifyUrl}</p>
+                </div>
+            `,
+                });
 
                 return res.status(200).json({
-                    message: "📩 인증 메일이 발송되었습니다! 메일함을 확인해주세요.",
+                    message: "인증 메일이 발송되었습니다.",
                 });
-            });
+            } catch (error) {
+                console.error("메일 발송 실패:", error);
+                return res.status(500).json({ message: "메일 발송 실패" });
+            }
         };
-
+        
+        /*  const sendVerificationMail = async () => {
+              // const transporter = gmailTransporter;
+  
+              const mailOptions = {
+                  from: `Lecture AI <${process.env.GMAIL_USER}>`,
+                  to: cleanEmail,
+                  subject: "[Lecture AI] 이메일 인증을 완료해주세요",
+                  html: `
+                      <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
+                          <div style="max-width:500px;margin:0 auto;background:white;padding:24px;border-radius:12px;border:1px solid #eee;">
+                              <h2 style="color:#2383e2;">Lecture AI 이메일 인증</h2>
+                              <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
+                              <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 18px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;">
+                                  이메일 인증하기
+                              </a>
+                              <p style="margin-top:20px;color:#666;font-size:13px;">
+                                  버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
+                                  ${verifyUrl}
+                              </p>
+                          </div>
+                      </div>
+                  `,
+              };
+  
+              try {
+                  await resend.emails.send({
+                      from: process.env.EMAIL_FROM,
+                      to: cleanEmail,
+                      subject: "[Lecture AI] 이메일 인증",
+                      html: `
+              <div style="padding:40px;font-family:sans-serif;">
+                  <h2>Lecture AI 이메일 인증</h2>
+  
+                  <p>아래 버튼을 눌러 인증해주세요.</p>
+  
+                  <a
+                      href="${verifyUrl}"
+                      style="
+                          display:inline-block;
+                          padding:12px 20px;
+                          background:#2563eb;
+                          color:white;
+                          text-decoration:none;
+                          border-radius:8px;
+                      "
+                  >
+                      이메일 인증하기
+                  </a>
+  
+                  <p style="margin-top:20px;">
+                      ${verifyUrl}
+                  </p>
+              </div>
+          `,
+                  });
+  
+                  return res.status(200).json({
+                      message: "인증 메일이 발송되었습니다.",
+                  });
+  
+              } catch (error) {
+                  console.error("메일 발송 실패:", error);
+  
+                  return res.status(500).json({
+                      message: "메일 발송 실패",
+                  });
+              }
+          }; */
         db.query(
             "SELECT user_id, is_verified FROM users WHERE email = ? LIMIT 1",
             [cleanEmail],
@@ -1288,14 +1347,23 @@ app.post("/api/login", (req, res) => {
             user_id: user.user_id,
             name: user.name,
             email: user.email,
-            is_admin: !!user.is_admin,  
+            is_admin: !!user.is_admin,
         };
         const token = createToken(safeUser);
         return res.status(200).json({ token, user: safeUser });
     });
 });
-// 인증 메일 재발송 API
+
+// 인증 메일 재발송 API 안돼서 잠시교체
+
 app.post("/api/resend-verification", async (req, res) => {
+    return res.status(501).json({
+        message: "인증 메일 재발송은 현재 Resend 전환 중입니다.",
+    });
+});
+
+/*app.post("/api/resend-verification", async (req, res) => {
+
     const { email } = req.body;
     if (!email) return res.status(400).json({ message: "이메일이 필요합니다." });
 
@@ -1315,30 +1383,30 @@ app.post("/api/resend-verification", async (req, res) => {
             const transporter = email.includes("naver.com") ? naverTransporter : gmailTransporter;
             const fromUser = email.includes("naver.com") ? process.env.NAVER_USER : process.env.GMAIL_USER;
 
-            transporter.sendMail({
-                from: `Lecture AI <${fromUser}>`,
-                to: email.trim(),
-                subject: "[Lecture AI] 인증 메일 재발송",
-                html: `
-                  <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
-                    <div style="max-width:500px;margin:0 auto;background:white;padding:20px;border-radius:12px;border:1px solid #eee;">
-                      <h2 style="color:#2383e2;">인증 메일 재발송 안내</h2>
-                      <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
-                      <a href="${verifyUrl}" style="display:inline-block;padding:12px 24px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;margin:20px 0;">이메일 인증하기</a>
-                      <p style="font-size:12px;color:#999;">이전 인증 링크는 더 이상 사용할 수 없습니다.</p>
-                    </div>
-                  </div>
-                `,
-            }, (mailErr) => {
+             transporter.sendMail({
+              from: `Lecture AI <${fromUser}>`,
+             to: email.trim(),
+             subject: "[Lecture AI] 인증 메일 재발송",
+            html: `
+              <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
+               <div style="max-width:500px;margin:0 auto;background:white;padding:20px;border-radius:12px;border:1px solid #eee;">
+                <h2 style="color:#2383e2;">인증 메일 재발송 안내</h2>
+               <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
+             <a href="${verifyUrl}" style="display:inline-block;padding:12px 24px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;margin:20px 0;">이메일 인증하기</a>
+             <p style="font-size:12px;color:#999;">이전 인증 링크는 더 이상 사용할 수 없습니다.</p>
+             </div>
+             </div>
+              `,
+             }, (mailErr) => {
                 if (mailErr) {
-                    console.error("재발송 메일 실패:", mailErr);
-                    return res.status(500).json({ message: "메일 발송 실패" });
-                }
-                return res.status(200).json({ message: "인증 메일이 재발송되었습니다." });
-            });
-        });
-    });
-});
+                  console.error("재발송 메일 실패:", mailErr);
+                return res.status(500).json({ message: "메일 발송 실패" });
+             }
+              return res.status(200).json({ message: "인증 메일이 재발송되었습니다." });
+             });
+              });
+             });
+             });*/
 
 // 강의 저장
 app.post("/api/lectures", requireAuth, lectureFileUpload.array("files", 10), (req, res) => {
@@ -1867,7 +1935,7 @@ app.post("/api/summarize", requireAuth, lectureFileUpload.array("files", 10), as
         }
 
         // 요약용 임시 업로드 파일은 저장하지 않고 삭제
-        fs.unlink(file.path, () => {});
+        fs.unlink(file.path, () => { });
     }
 
     const combinedText = [
