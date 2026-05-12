@@ -16,9 +16,14 @@ const AdmZip = require("adm-zip");
 const ffmpeg = require("fluent-ffmpeg"); // npm install fluent-ffmpeg
 const ffmpegPath = require("ffmpeg-static"); //npm install fluent-ffmpeg ffmpeg-static
 require("dotenv").config();
+const brevo = require("@getbrevo/brevo");
 
-const { Resend } = require("resend");
-const resend = new Resend(process.env.RESEND_API_KEY);
+const brevoApi = new brevo.TransactionalEmailsApi();
+brevoApi.setApiKey(
+    brevo.TransactionalEmailsApiApiKeys.apiKey,
+    process.env.BREVO_API_KEY
+);
+
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const lectureUploadDir = "lecture_uploads/";
@@ -1156,16 +1161,30 @@ app.post("/api/signup", async (req, res) => {
 
         const sendVerificationMail = async () => {
             try {
-                await resend.emails.send({
-                    from: process.env.EMAIL_FROM,
-                    to: cleanEmail,
+                await brevoApi.sendTransacEmail({
+                    sender: {
+                        name: process.env.BREVO_SENDER_NAME || "Lecture AI",
+                        email: process.env.BREVO_SENDER_EMAIL,
+                    },
+                    to: [
+                        {
+                            email: cleanEmail,
+                            name: cleanName,
+                        },
+                    ],
                     subject: "[Lecture AI] 이메일 인증",
-                    html: `
+                    htmlContent: `
                 <div style="padding:40px;font-family:sans-serif;">
                     <h2>Lecture AI 이메일 인증</h2>
                     <p>아래 버튼을 눌러 인증해주세요.</p>
-                    <a href="${verifyUrl}">이메일 인증하기</a>
-                    <p>${verifyUrl}</p>
+                    <a href="${verifyUrl}"
+                       style="display:inline-block;padding:12px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:8px;">
+                        이메일 인증하기
+                    </a>
+                    <p style="margin-top:20px;color:#666;font-size:13px;">
+                        버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
+                        ${verifyUrl}
+                    </p>
                 </div>
             `,
                 });
@@ -1174,11 +1193,13 @@ app.post("/api/signup", async (req, res) => {
                     message: "인증 메일이 발송되었습니다.",
                 });
             } catch (error) {
-                console.error("메일 발송 실패:", error);
-                return res.status(500).json({ message: "메일 발송 실패" });
+                console.error("Brevo 메일 발송 실패:", error?.body || error);
+                return res.status(500).json({
+                    message: "메일 발송 실패",
+                });
             }
         };
-        
+
         /*  const sendVerificationMail = async () => {
               // const transporter = gmailTransporter;
   
