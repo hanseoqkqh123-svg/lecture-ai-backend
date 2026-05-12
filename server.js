@@ -1121,6 +1121,7 @@ const gmailTransporter = nodemailer.createTransport({
     host: "smtp.gmail.com",
     port: 587,
     secure: false,
+    family: 4,
     auth: {
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_PASS,
@@ -1129,6 +1130,8 @@ const gmailTransporter = nodemailer.createTransport({
         rejectUnauthorized: false,
     },
 });
+console.log("GMAIL_USER:", process.env.GMAIL_USER);
+console.log("GMAIL_PASS EXISTS:", !!process.env.GMAIL_PASS);
 
 //1. 회원가입 api
 app.post("/api/signup", async (req, res) => {
