@@ -525,6 +525,52 @@ app.get("/", (req, res) => {
     res.send("🚀 캡스톤 9조 백엔드 서버가 성공적으로 켜졌습니다!");
 });
 
+app.post("/api/ai-chat", requireAuth, async (req, res) => {
+    try {
+        const { messages, lectureContext } = req.body;
+
+        const systemPrompt = lectureContext
+            ? `너는 강의 내용을 바탕으로 답변하는 한국어 AI 튜터야.
+
+아래 강의 내용을 참고해서 사용자의 질문에 답변해.
+
+${lectureContext}`
+            : "너는 친절한 한국어 AI 튜터야. 사용자의 질문에 쉽고 정확하게 답변해.";
+
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    ...(Array.isArray(messages) ? messages : []),
+                ],
+            }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            return res.status(response.status).json({
+                message: data.error?.message || "AI 응답 생성 실패",
+            });
+        }
+
+        return res.status(200).json({
+            answer: data.choices?.[0]?.message?.content || "답변을 생성하지 못했습니다.",
+        });
+    } catch (err) {
+        console.error("AI 질문 오류:", err);
+        return res.status(500).json({
+            message: err.message || "AI 질문 처리 중 오류가 발생했습니다.",
+        });
+    }
+});
+
 // 친구 검색 및 요청
 // 친구 요청 API (이메일로 친구 추가)
 // 친구 검색 및 요청
@@ -1055,6 +1101,148 @@ app.delete("/api/friends/:friendId", requireAuth, (req, res) => {
         }
     );
 });
+
+
+function emitBoardToFriendsAndSelf(ownerId, eventName, payload) {
+    io.to(`user_${ownerId}`).emit(eventName, payload);
+
+    db.query(
+        `
+        SELECT CASE
+            WHEN user_id = ? THEN friend_id
+            ELSE user_id
+        END AS friend_id
+        FROM friends
+        WHERE (user_id = ? OR friend_id = ?)
+          AND status = 'accepted'
+        `,
+        [ownerId, ownerId, ownerId],
+        (err, rows) => {
+            if (err) {
+                console.error("보드 친구 조회 실패:", err);
+                return;
+            }
+
+            rows.forEach((row) => {
+                io.to(`user_${row.friend_id}`).emit(eventName, payload);
+            });
+        }
+    );
+}
+
+app.get("/api/board/items", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+
+    const sql = `
+        SELECT bi.*
+        FROM board_items bi
+        WHERE bi.owner_id = ?
+           OR bi.owner_id IN (
+                SELECT CASE
+                    WHEN user_id = ? THEN friend_id
+                    ELSE user_id
+                END
+                FROM friends
+                WHERE (user_id = ? OR friend_id = ?)
+                  AND status = 'accepted'
+           )
+        ORDER BY bi.created_at ASC
+    `;
+
+    db.query(sql, [userId, userId, userId, userId], (err, rows) => {
+        if (err) {
+            console.error("보드 목록 조회 실패:", err);
+            return res.status(500).json({ message: "보드 목록 조회 실패" });
+        }
+
+        const items = rows.map((row) => ({
+            id: row.id,
+            owner_id: row.owner_id,
+            item_type: row.item_type,
+            data: typeof row.data === "string" ? JSON.parse(row.data) : row.data,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }));
+
+        res.json(items);
+    });
+});
+
+app.post("/api/board/items", requireAuth, (req, res) => {
+    const ownerId = req.user.user_id;
+    const { id, item_type, data } = req.body;
+
+    if (!id || !item_type || !data) {
+        return res.status(400).json({ message: "보드 데이터가 부족합니다." });
+    }
+
+    const sql = `
+        INSERT INTO board_items (id, owner_id, item_type, data)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE data = VALUES(data)
+    `;
+
+    db.query(sql, [id, ownerId, item_type, JSON.stringify(data)], (err) => {
+        if (err) {
+            console.error("보드 저장 실패:", err);
+            return res.status(500).json({ message: "보드 저장 실패" });
+        }
+
+        const payload = { id, owner_id: ownerId, item_type, data };
+        emitBoardToFriendsAndSelf(ownerId, "board_item_saved", payload);
+
+        res.json(payload);
+    });
+});
+
+app.delete("/api/board/items", requireAuth, (req, res) => {
+    const ownerId = req.user.user_id;
+
+    db.query(
+        "DELETE FROM board_items WHERE owner_id = ?",
+        [ownerId],
+        (err) => {
+            if (err) {
+                console.error("보드 전체 삭제 실패:", err);
+                return res.status(500).json({ message: "보드 전체 삭제 실패" });
+            }
+
+            emitBoardToFriendsAndSelf(ownerId, "board_cleared", {
+                owner_id: ownerId,
+            });
+
+            res.json({ message: "보드 전체 삭제 완료" });
+        }
+    );
+});
+
+app.delete("/api/board/items/:id", requireAuth, (req, res) => {
+    const ownerId = req.user.user_id;
+    const itemId = req.params.id;
+
+    db.query(
+        "DELETE FROM board_items WHERE id = ? AND owner_id = ?",
+        [itemId, ownerId],
+        (err, result) => {
+            if (err) {
+                console.error("보드 삭제 실패:", err);
+                return res.status(500).json({ message: "보드 삭제 실패" });
+            }
+
+            if (result.affectedRows === 0) {
+                return res.status(403).json({ message: "삭제 권한이 없습니다." });
+            }
+
+            emitBoardToFriendsAndSelf(ownerId, "board_item_deleted", {
+                id: itemId,
+                owner_id: ownerId,
+            });
+
+            res.json({ message: "삭제되었습니다." });
+        }
+    );
+});
+
 
 // 단체 채팅방 생성 API (Internal Server Error 방지 버전)
 app.post("/api/chat/rooms", requireAuth, (req, res) => {
@@ -1932,26 +2120,41 @@ app.post("/api/summarize", requireAuth, lectureFileUpload.array("files", 10), as
 
     const extractedParts = [];
 
-    for (const file of req.files || []) {
-        const originalName = fixOriginalName(file.originalname);
-        const extractedText = await extractLectureFileText(file);
+for (const file of req.files || []) {
+    const originalName = fixOriginalName(file.originalname);
+    const extractedText = await extractLectureFileText(file);
 
-        if (String(extractedText || "").trim()) {
-            extractedParts.push(`파일명: ${originalName}\n${extractedText}`);
-        }
-
-        // 요약용 임시 업로드 파일은 저장하지 않고 삭제
-        fs.unlink(file.path, () => { });
+    if (String(extractedText || "").trim()) {
+        extractedParts.push(`파일명: ${originalName}\n${extractedText}`);
     }
 
-    const combinedText = [
-        String(text || "").trim() ? `사용자 입력 내용:\n${String(text || "").trim()}` : "",
-        extractedParts.length > 0
-            ? `첨부파일에서 추출한 내용:\n${extractedParts.join("\n\n")}`
-            : "",
-    ]
-        .filter(Boolean)
-        .join("\n\n");
+    // 요약용 임시 업로드 파일은 저장하지 않고 삭제
+    fs.unlink(file.path, () => { });
+}
+
+    const normalizedParts = extractedParts
+    .map((part, index) => {
+        const cleaned = String(part || "").trim();
+
+        if (!cleaned) return "";
+
+        return [
+            "==============================",
+            `첨부파일 ${index + 1} 추출 내용`,
+            "==============================",
+            cleaned,
+        ].join("\n");
+    })
+    .filter(Boolean);
+
+const combinedText = [
+    String(text || "").trim()
+        ? `사용자 입력 내용:\n${String(text || "").trim()}`
+        : "",
+    ...normalizedParts,
+]
+    .filter(Boolean)
+    .join("\n\n");
 
     if (!combinedText.trim()) {
         return res.status(400).json({ message: "요약할 텍스트나 파일 내용이 없습니다." });
@@ -1981,6 +2184,58 @@ app.post("/api/summarize", requireAuth, lectureFileUpload.array("files", 10), as
     } else {
         typeInstruction = `문제 유형을 아래 유형들 사이에서 골고루 섞어라: ${quizTypes.map(t => ({ short: "단답형", mcq: "객관식", ox: "OX" }[t])).join(", ")}.`;
     }
+
+    const summarizeOneFile = async (content, index) => {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "user",
+                    content: `
+다음은 첨부파일 ${index + 1}의 강의 원문이다.
+중요 개념, 코드, 키워드, 시험 포인트가 빠지지 않게 한국어로 자세히 요약해라.
+
+강의 원문:
+${content.slice(0, 24000)}
+`,
+                },
+            ],
+            temperature: 0,
+        }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.error?.message || `첨부파일 ${index + 1} 요약 실패`);
+    }
+
+    return data.choices?.[0]?.message?.content || "";
+};
+
+const fileSummaries = [];
+
+for (let i = 0; i < extractedParts.length; i++) {
+    const summary = await summarizeOneFile(extractedParts[i], i);
+    fileSummaries.push(`첨부파일 ${i + 1} 요약:\n${summary}`);
+}
+
+const summarySourceText = [
+    String(text || "").trim()
+        ? `사용자 입력 내용:\n${String(text || "").trim()}`
+        : "",
+    fileSummaries.length > 0
+        ? `첨부파일별 요약:\n${fileSummaries.join("\n\n")}`
+        : "",
+]
+    .filter(Boolean)
+    .join("\n\n");
 
     try {
         const prompt = `
@@ -2118,7 +2373,7 @@ quiz 배열 규칙:
 - 강의 맥락 기반 설명
 
 강의 내용:
-${combinedText.slice(0, 24000)}
+${summarySourceText}
 `;
 
         const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -2151,11 +2406,31 @@ ${combinedText.slice(0, 24000)}
             throw new Error("JSON 파싱 실패");
         }
 
-        const parsed = JSON.parse(match[0]);
+        let parsed;
+
+try {
+    parsed = JSON.parse(match[0]);
+} catch (parseErr) {
+    console.error("JSON 파싱 실패 원문:", raw);
+
+    const repairedJson = match[0]
+        .replace(/\r?\n/g, "\\n")
+        .replace(/\t/g, "\\t");
+
+    parsed = JSON.parse(repairedJson);
+}
 
         return res.status(200).json({
             ...parsed,
-            extractedText: combinedText.slice(0, 12000),
+
+            // 프론트 화면/저장용 원문은 자르지 않고 전체 반환
+            extractedText: combinedText,
+
+            // 디버깅/표시용 파일별 추출 정보
+            extractedFiles: extractedParts.map((part) => ({
+                text: part,
+                length: part.length,
+            })),
         });
 
     } catch (err) {
@@ -2196,6 +2471,8 @@ app.post("/api/translate-summarize", requireAuth, async (req, res) => {
 다음 강의 내용을 분석해서 반드시 JSON 형식으로만 응답해.
 
 설명 문장 절대 쓰지 말고 JSON만 반환해.
+JSON 문자열 안에는 실제 줄바꿈을 넣지 말고 반드시 \\n으로 이스케이프해라.
+summary, keywordExplanations, studyGuide의 모든 문자열은 한 줄 문자열로 작성해라.
 
 중요:
 - keywords 배열에는 실제 핵심 키워드만 넣어라.
