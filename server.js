@@ -15,8 +15,9 @@ const pdfParse = require("pdf-parse");
 const AdmZip = require("adm-zip");
 const ffmpeg = require("fluent-ffmpeg"); // npm install fluent-ffmpeg
 const ffmpegPath = require("ffmpeg-static"); //npm install fluent-ffmpeg ffmpeg-static
-require("dotenv").config();
 ffmpeg.setFfmpegPath(ffmpegPath);
+
+require("dotenv").config();
 
 const lectureUploadDir = "lecture_uploads/";
 if (!fs.existsSync(lectureUploadDir)) {
@@ -185,6 +186,36 @@ function convertToWav(inputPath, outputPath) {
             .save(outputPath);
     });
 }
+// lecture_uploads에 저장된 실제 파일들을 디스크에서 삭제
+function deleteLectureFiles(summaryData) {
+    let parsed = {};
+    try {
+        parsed = typeof summaryData === "string" ? JSON.parse(summaryData) : summaryData || {};
+    } catch {
+        return;
+    }
+
+    const files = Array.isArray(parsed.files) ? parsed.files : [];
+    for (const file of files) {
+        const filename = file?.filename;
+        if (!filename) continue;
+
+        // filename이 "lecture_uploads/xxx" 형태이거나 파일명만 있는 경우 모두 처리
+        const filePath = filename.startsWith("lecture_uploads/")
+            ? filename
+            : path.join(lectureUploadDir, filename);
+
+        try {
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+                console.log(`🗑️  파일 삭제: ${filePath}`);
+            }
+        } catch (e) {
+            console.error(`파일 삭제 실패 (${filePath}):`, e.message);
+        }
+    }
+}
+
 if (!process.env.JWT_SECRET) {
     console.error("❌ JWT_SECRET 환경변수가 설정되지 않았습니다. 서버를 종료합니다.");
     process.exit(1);
@@ -218,6 +249,21 @@ function requireAuth(req, res, next) {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch {
+        return res.status(401).json({ message: "토큰 오류" });
+    }
+}
+
+// ─── 관리자 전용 미들웨어 ───────────────────────────────────────────
+function requireAdmin(req, res, next) {
+    const auth = req.headers.authorization || "";
+    const token = auth.split(" ")[1];
+    if (!token) return res.status(401).json({ message: "인증 필요" });
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (!decoded.is_admin) return res.status(403).json({ message: "관리자 권한이 필요합니다." });
         req.user = decoded;
         next();
     } catch {
@@ -984,6 +1030,32 @@ app.get("/api/friends/:userId", requireAuth, (req, res) => {
     });
 });
 
+// 친구 삭제 API
+app.delete("/api/friends/:friendId", requireAuth, (req, res) => {
+    const userId = req.user.user_id;
+    const friendId = req.params.friendId;
+
+    if (String(userId) === String(friendId)) {
+        return res.status(400).json({ message: "자기 자신은 삭제할 수 없습니다." });
+    }
+
+    // 양방향 레코드 모두 삭제 (A→B, B→A)
+    db.query(
+        "DELETE FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)",
+        [userId, friendId, friendId, userId],
+        (err, result) => {
+            if (err) {
+                console.error("친구 삭제 오류:", err);
+                return res.status(500).json({ message: "친구 삭제 실패" });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ message: "친구 관계를 찾을 수 없습니다." });
+            }
+            return res.status(200).json({ message: "친구가 삭제되었습니다." });
+        }
+    );
+});
+
 // 단체 채팅방 생성 API (Internal Server Error 방지 버전)
 app.post("/api/chat/rooms", requireAuth, (req, res) => {
     const creatorId = req.user.user_id;
@@ -1104,35 +1176,25 @@ app.get("/api/chat/messages/:roomId", requireAuth, (req, res) => {
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
-
-//Render 에서 오류뜨면서 안돼서 잠시꺼둠
-// 1. 네이버 메일 전송 설정 
-// const naverTransporter = nodemailer.createTransport({
-//  host: "smtp.naver.com",
-// port: 465,
-// secure: true, // SSL 사용
-// auth: {
-// user: process.env.NAVER_USER, // 네이버 아이디 (예: abc@naver.com)
-// pass: process.env.NAVER_PASS  // 네이버 앱 비밀번호
-// }
-// });
+// 1. 네이버 메일 전송 설정
+const naverTransporter = nodemailer.createTransport({
+    host: "smtp.naver.com",
+    port: 465,
+    secure: true, // SSL 사용
+    auth: {
+        user: process.env.NAVER_USER, // 네이버 아이디 (예: abc@naver.com)
+        pass: process.env.NAVER_PASS  // 네이버 앱 비밀번호
+    }
+});
 
 // 2. 지메일 설정
-//const gmailTransporter = nodemailer.createTransport({
-// host: "smtp.gmail.com",
-//port: 587,
-//secure: false,
-//family: 4,
-//auth: {
-//user: process.env.GMAIL_USER,
-//pass: process.env.GMAIL_PASS,
-//},
-//tls: {
-//  rejectUnauthorized: false,
-//},
-//});
-console.log("GMAIL_USER:", process.env.GMAIL_USER);
-console.log("GMAIL_PASS EXISTS:", !!process.env.GMAIL_PASS);
+const gmailTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_PASS
+    }
+});
 
 //1. 회원가입 api
 app.post("/api/signup", async (req, res) => {
@@ -1151,127 +1213,44 @@ app.post("/api/signup", async (req, res) => {
         const verificationToken = crypto.randomBytes(32).toString("hex");
         const verifyUrl = `${process.env.BACKEND_URL || "http://localhost:5000"}/api/verify-email?token=${verificationToken}`;
 
-        const sendVerificationMail = async () => {
-            try {
-                const brevoRes = await fetch("https://api.brevo.com/v3/smtp/email", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "api-key": process.env.BREVO_API_KEY,
-                    },
-                    body: JSON.stringify({
-                        sender: {
-                            name: process.env.BREVO_SENDER_NAME || "Lecture AI",
-                            email: process.env.BREVO_SENDER_EMAIL,
-                        },
-                        to: [
-                            {
-                                email: cleanEmail,
-                                name: cleanName,
-                            },
-                        ],
-                        subject: "[Lecture AI] 이메일 인증",
-                        htmlContent: `
-                    <div style="padding:40px;font-family:sans-serif;">
-                        <h2>Lecture AI 이메일 인증</h2>
-                        <p>아래 버튼을 눌러 인증해주세요.</p>
-                        <a href="${verifyUrl}"
-                           style="display:inline-block;padding:12px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:8px;">
-                            이메일 인증하기
-                        </a>
-                        <p style="margin-top:20px;color:#666;font-size:13px;">
-                            버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
-                            ${verifyUrl}
-                        </p>
+        const sendVerificationMail = () => {
+            const transporter = gmailTransporter;
+
+            const mailOptions = {
+                from: `Lecture AI <${process.env.GMAIL_USER}>`,
+                to: cleanEmail,
+                subject: "[Lecture AI] 이메일 인증을 완료해주세요",
+                html: `
+                    <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
+                        <div style="max-width:500px;margin:0 auto;background:white;padding:24px;border-radius:12px;border:1px solid #eee;">
+                            <h2 style="color:#2383e2;">Lecture AI 이메일 인증</h2>
+                            <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
+                            <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 18px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;">
+                                이메일 인증하기
+                            </a>
+                            <p style="margin-top:20px;color:#666;font-size:13px;">
+                                버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
+                                ${verifyUrl}
+                            </p>
+                        </div>
                     </div>
                 `,
-                    }),
-                });
+            };
 
-                const resultText = await brevoRes.text();
-
-                if (!brevoRes.ok) {
-                    console.error("Brevo 메일 발송 실패:", resultText);
-                    return res.status(500).json({ message: "메일 발송 실패" });
+            transporter.sendMail(mailOptions, (mailErr) => {
+                if (mailErr) {
+                    console.error("메일 발송 실패:", mailErr);
+                    return res.status(500).json({
+                        message: "메일 발송에 실패했습니다. 백엔드 터미널의 메일 발송 실패 로그를 확인해주세요.",
+                    });
                 }
 
                 return res.status(200).json({
-                    message: "인증 메일이 발송되었습니다.",
+                    message: "📩 인증 메일이 발송되었습니다! 메일함을 확인해주세요.",
                 });
-            } catch (error) {
-                console.error("Brevo 메일 발송 오류:", error);
-                return res.status(500).json({ message: "메일 발송 실패" });
-            }
+            });
         };
 
-        /*  const sendVerificationMail = async () => {
-              // const transporter = gmailTransporter;
-  
-              const mailOptions = {
-                  from: `Lecture AI <${process.env.GMAIL_USER}>`,
-                  to: cleanEmail,
-                  subject: "[Lecture AI] 이메일 인증을 완료해주세요",
-                  html: `
-                      <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
-                          <div style="max-width:500px;margin:0 auto;background:white;padding:24px;border-radius:12px;border:1px solid #eee;">
-                              <h2 style="color:#2383e2;">Lecture AI 이메일 인증</h2>
-                              <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
-                              <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 18px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;">
-                                  이메일 인증하기
-                              </a>
-                              <p style="margin-top:20px;color:#666;font-size:13px;">
-                                  버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
-                                  ${verifyUrl}
-                              </p>
-                          </div>
-                      </div>
-                  `,
-              };
-  
-              try {
-                  await resend.emails.send({
-                      from: process.env.EMAIL_FROM,
-                      to: cleanEmail,
-                      subject: "[Lecture AI] 이메일 인증",
-                      html: `
-              <div style="padding:40px;font-family:sans-serif;">
-                  <h2>Lecture AI 이메일 인증</h2>
-  
-                  <p>아래 버튼을 눌러 인증해주세요.</p>
-  
-                  <a
-                      href="${verifyUrl}"
-                      style="
-                          display:inline-block;
-                          padding:12px 20px;
-                          background:#2563eb;
-                          color:white;
-                          text-decoration:none;
-                          border-radius:8px;
-                      "
-                  >
-                      이메일 인증하기
-                  </a>
-  
-                  <p style="margin-top:20px;">
-                      ${verifyUrl}
-                  </p>
-              </div>
-          `,
-                  });
-  
-                  return res.status(200).json({
-                      message: "인증 메일이 발송되었습니다.",
-                  });
-  
-              } catch (error) {
-                  console.error("메일 발송 실패:", error);
-  
-                  return res.status(500).json({
-                      message: "메일 발송 실패",
-                  });
-              }
-          }; */
         db.query(
             "SELECT user_id, is_verified FROM users WHERE email = ? LIMIT 1",
             [cleanEmail],
@@ -1378,17 +1357,8 @@ app.post("/api/login", (req, res) => {
         return res.status(200).json({ token, user: safeUser });
     });
 });
-
-// 인증 메일 재발송 API 안돼서 잠시교체
-
+// 인증 메일 재발송 API
 app.post("/api/resend-verification", async (req, res) => {
-    return res.status(501).json({
-        message: "인증 메일 재발송은 현재 Resend 전환 중입니다.",
-    });
-});
-
-/*app.post("/api/resend-verification", async (req, res) => {
-
     const { email } = req.body;
     if (!email) return res.status(400).json({ message: "이메일이 필요합니다." });
 
@@ -1408,30 +1378,30 @@ app.post("/api/resend-verification", async (req, res) => {
             const transporter = email.includes("naver.com") ? naverTransporter : gmailTransporter;
             const fromUser = email.includes("naver.com") ? process.env.NAVER_USER : process.env.GMAIL_USER;
 
-             transporter.sendMail({
-              from: `Lecture AI <${fromUser}>`,
-             to: email.trim(),
-             subject: "[Lecture AI] 인증 메일 재발송",
-            html: `
-              <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
-               <div style="max-width:500px;margin:0 auto;background:white;padding:20px;border-radius:12px;border:1px solid #eee;">
-                <h2 style="color:#2383e2;">인증 메일 재발송 안내</h2>
-               <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
-             <a href="${verifyUrl}" style="display:inline-block;padding:12px 24px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;margin:20px 0;">이메일 인증하기</a>
-             <p style="font-size:12px;color:#999;">이전 인증 링크는 더 이상 사용할 수 없습니다.</p>
-             </div>
-             </div>
-              `,
-             }, (mailErr) => {
+            transporter.sendMail({
+                from: `Lecture AI <${fromUser}>`,
+                to: email.trim(),
+                subject: "[Lecture AI] 인증 메일 재발송",
+                html: `
+                  <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
+                    <div style="max-width:500px;margin:0 auto;background:white;padding:20px;border-radius:12px;border:1px solid #eee;">
+                      <h2 style="color:#2383e2;">인증 메일 재발송 안내</h2>
+                      <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
+                      <a href="${verifyUrl}" style="display:inline-block;padding:12px 24px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;margin:20px 0;">이메일 인증하기</a>
+                      <p style="font-size:12px;color:#999;">이전 인증 링크는 더 이상 사용할 수 없습니다.</p>
+                    </div>
+                  </div>
+                `,
+            }, (mailErr) => {
                 if (mailErr) {
-                  console.error("재발송 메일 실패:", mailErr);
-                return res.status(500).json({ message: "메일 발송 실패" });
-             }
-              return res.status(200).json({ message: "인증 메일이 재발송되었습니다." });
-             });
-              });
-             });
-             });*/
+                    console.error("재발송 메일 실패:", mailErr);
+                    return res.status(500).json({ message: "메일 발송 실패" });
+                }
+                return res.status(200).json({ message: "인증 메일이 재발송되었습니다." });
+            });
+        });
+    });
+});
 
 // 강의 저장
 app.post("/api/lectures", requireAuth, lectureFileUpload.array("files", 10), (req, res) => {
@@ -1638,26 +1608,37 @@ app.delete("/api/lectures/:lectureId", requireAuth, (req, res) => {
     const lectureId = req.params.lectureId;
     const user_id = req.user.user_id;
 
-    const deleteQuizHistorySql = `DELETE FROM quiz_history WHERE lecture_id = ? AND user_id = ?`;
-    const deleteLectureSql = `DELETE FROM lectures WHERE id = ? AND user_id = ?`;
-
-    db.query(deleteQuizHistorySql, [lectureId, user_id], (quizErr) => {
-        if (quizErr) {
-            console.error("퀴즈 히스토리 삭제 오류:", quizErr);
-            return res.status(500).json({ message: "연결된 퀴즈 기록 삭제 실패" });
+    // 파일 경로 먼저 조회 → 퀴즈 히스토리 → 강의 순으로 삭제
+    db.query("SELECT summary_data FROM lectures WHERE id = ? AND user_id = ?", [lectureId, user_id], (findErr, rows) => {
+        if (findErr) {
+            console.error("강의 조회 오류:", findErr);
+            return res.status(500).json({ message: "강의 조회 실패" });
+        }
+        if (rows.length === 0) {
+            return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
         }
 
-        db.query(deleteLectureSql, [lectureId, user_id], (err, result) => {
-            if (err) {
-                console.error("강의 삭제 오류:", err);
-                return res.status(500).json({ message: "강의 삭제 실패" });
+        // 실제 파일 삭제 (없는 파일은 조용히 스킵)
+        deleteLectureFiles(rows[0].summary_data);
+
+        db.query("DELETE FROM quiz_history WHERE lecture_id = ? AND user_id = ?", [lectureId, user_id], (quizErr) => {
+            if (quizErr) {
+                console.error("퀴즈 히스토리 삭제 오류:", quizErr);
+                return res.status(500).json({ message: "연결된 퀴즈 기록 삭제 실패" });
             }
 
-            if (result.affectedRows === 0) {
-                return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
-            }
+            db.query("DELETE FROM lectures WHERE id = ? AND user_id = ?", [lectureId, user_id], (err, result) => {
+                if (err) {
+                    console.error("강의 삭제 오류:", err);
+                    return res.status(500).json({ message: "강의 삭제 실패" });
+                }
 
-            return res.status(200).json({ message: "강의가 삭제되었습니다." });
+                if (result.affectedRows === 0) {
+                    return res.status(404).json({ message: "강의를 찾을 수 없거나 권한이 없습니다." });
+                }
+
+                return res.status(200).json({ message: "강의가 삭제되었습니다." });
+            });
         });
     });
 });
@@ -2368,21 +2349,6 @@ ${text.slice(0, 8000)}
     }
 });
 
-// ─── 관리자 전용 미들웨어 ───────────────────────────────────────────
-function requireAdmin(req, res, next) {
-    const auth = req.headers.authorization || "";
-    const token = auth.split(" ")[1];
-    if (!token) return res.status(401).json({ message: "인증 필요" });
-    try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        if (!decoded.is_admin) return res.status(403).json({ message: "관리자 권한이 필요합니다." });
-        req.user = decoded;
-        next();
-    } catch {
-        return res.status(401).json({ message: "토큰 오류" });
-    }
-}
-
 // ─── 전체 유저 목록 조회 ────────────────────────────────────────────
 app.get("/api/admin/users", requireAdmin, (req, res) => {
     db.query(
@@ -2410,7 +2376,11 @@ app.delete("/api/admin/users/:userId", requireAdmin, (req, res) => {
     (async () => {
         // 1. 퀴즈 히스토리
         await run("DELETE FROM quiz_history WHERE user_id = ?", [targetId]);
-        // 2. 강의
+        // 2. 강의 파일 디스크 삭제 → DB 삭제
+        const lectures = await run("SELECT summary_data FROM lectures WHERE user_id = ?", [targetId]);
+        for (const lecture of lectures) {
+            deleteLectureFiles(lecture.summary_data);
+        }
         await run("DELETE FROM lectures WHERE user_id = ?", [targetId]);
         // 3. 친구 관계
         await run("DELETE FROM friends WHERE user_id = ? OR friend_id = ?", [targetId, targetId]);
@@ -2466,12 +2436,22 @@ app.get("/api/admin/lectures", requireAdmin, (req, res) => {
 // ─── 강의 삭제 ─────────────────────────────────────────────────────
 app.delete("/api/admin/lectures/:lectureId", requireAdmin, (req, res) => {
     const lectureId = req.params.lectureId;
-    db.query("DELETE FROM quiz_history WHERE lecture_id = ?", [lectureId], (e1) => {
-        if (e1) return res.status(500).json({ message: "퀴즈 히스토리 삭제 실패" });
-        db.query("DELETE FROM lectures WHERE id = ?", [lectureId], (e2, result) => {
-            if (e2) return res.status(500).json({ message: "강의 삭제 실패" });
-            if (result.affectedRows === 0) return res.status(404).json({ message: "강의를 찾을 수 없습니다." });
-            return res.status(200).json({ message: "강의가 삭제되었습니다." });
+
+    // 파일 경로 조회 후 → 퀴즈 히스토리 → 강의 순으로 삭제
+    db.query("SELECT summary_data FROM lectures WHERE id = ?", [lectureId], (e0, rows) => {
+        if (e0) return res.status(500).json({ message: "강의 조회 실패" });
+        if (rows.length === 0) return res.status(404).json({ message: "강의를 찾을 수 없습니다." });
+
+        // 실제 파일 삭제 (없는 파일은 조용히 스킵)
+        deleteLectureFiles(rows[0].summary_data);
+
+        db.query("DELETE FROM quiz_history WHERE lecture_id = ?", [lectureId], (e1) => {
+            if (e1) return res.status(500).json({ message: "퀴즈 히스토리 삭제 실패" });
+            db.query("DELETE FROM lectures WHERE id = ?", [lectureId], (e2, result) => {
+                if (e2) return res.status(500).json({ message: "강의 삭제 실패" });
+                if (result.affectedRows === 0) return res.status(404).json({ message: "강의를 찾을 수 없습니다." });
+                return res.status(200).json({ message: "강의가 삭제되었습니다." });
+            });
         });
     });
 });
@@ -2492,79 +2472,103 @@ app.get("/api/admin/quiz-history", requireAdmin, (req, res) => {
     );
 });
 
-// ─── AI 질문 채팅 ────────────────────────────────────────────────────
-app.post("/api/ai-chat", requireAuth, async (req, res) => {
-    const { messages, lectureContext } = req.body;
+// ─── 관리자 대시보드 통계 ────────────────────────────────────────────
+app.get("/api/admin/stats", requireAdmin, (req, res) => {
+    const run = (sql, params = []) =>
+        new Promise((resolve, reject) =>
+            db.query(sql, params, (err, result) => (err ? reject(err) : resolve(result)))
+        );
 
-    if (!Array.isArray(messages) || messages.length === 0) {
-        return res.status(400).json({ message: "메시지가 없습니다." });
-    }
+    (async () => {
+        const [
+            userCount,
+            verifiedCount,
+            lectureCount,
+            quizCount,
+            avgScore,
+            newUsersWeek,
+            newLecturesWeek,
+            dailyUsers,
+            dailyLectures,
+            topQuizzers,
+        ] = await Promise.all([
+            run("SELECT COUNT(*) AS cnt FROM users"),
+            run("SELECT COUNT(*) AS cnt FROM users WHERE is_verified = 1"),
+            run("SELECT COUNT(*) AS cnt FROM lectures"),
+            run("SELECT COUNT(*) AS cnt FROM quiz_history"),
+            run("SELECT ROUND(AVG(score), 1) AS avg FROM quiz_history"),
+            run("SELECT COUNT(*) AS cnt FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"),
+            run("SELECT COUNT(*) AS cnt FROM lectures WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"),
+            run(`SELECT DATE(created_at) AS day, COUNT(*) AS cnt
+                 FROM users
+                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)
+                 GROUP BY day ORDER BY day ASC`),
+            run(`SELECT DATE(created_at) AS day, COUNT(*) AS cnt
+                 FROM lectures
+                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL 14 DAY)
+                 GROUP BY day ORDER BY day ASC`),
+            run(`SELECT u.name, u.email, COUNT(*) AS quiz_cnt, ROUND(AVG(qh.score),1) AS avg_score, SUM(qh.total) AS total_questions
+                 FROM quiz_history qh
+                 JOIN users u ON qh.user_id = u.user_id
+                 GROUP BY qh.user_id, u.name, u.email
+                 ORDER BY (COUNT(*) * SUM(qh.total)) DESC LIMIT 5`),
+        ]);
 
-    const recentMessages = messages
-        .slice(-20)
-        .map((m) => ({
-            role: m.role === "assistant" ? "assistant" : "user",
-            content: String(m.content || "").trim(),
-        }))
-        .filter((m) => m.content);
-
-    const systemPrompt = lectureContext
-        ? `당신은 Lecture AI의 학습 도우미입니다.
-
-아래 강의 내용을 참고해서 학생의 질문에 답변하세요.
-
-답변 규칙:
-- 한국어로 답변
-- 너무 딱딱하지 않게 설명
-- 강의 내용과 관련 있으면 강의 내용을 우선 참고
-- 학생이 이해하기 쉽게 예시를 들어 설명
-- 모르면 지어내지 말고 확인이 필요하다고 말하기
-
-[강의 내용]
-${String(lectureContext).slice(0, 6000)}`
-        : `당신은 Lecture AI의 학습 도우미입니다.
-
-답변 규칙:
-- 한국어로 답변
-- 학생이 이해하기 쉽게 설명
-- 필요하면 예시를 들어 설명
-- 모르면 지어내지 말고 확인이 필요하다고 말하기`;
-
-    try {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            },
-            body: JSON.stringify({
-                model: "gpt-4o-mini",
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    ...recentMessages,
-                ],
-                max_tokens: 1000,
-                temperature: 0.7,
-            }),
+        return res.status(200).json({
+            userCount: userCount[0].cnt,
+            verifiedCount: verifiedCount[0].cnt,
+            lectureCount: lectureCount[0].cnt,
+            quizCount: quizCount[0].cnt,
+            avgScore: avgScore[0].avg ?? 0,
+            newUsersWeek: newUsersWeek[0].cnt,
+            newLecturesWeek: newLecturesWeek[0].cnt,
+            dailyUsers,
+            dailyLectures,
+            topQuizzers,
         });
+    })().catch((err) => {
+        console.error("통계 조회 오류:", err);
+        return res.status(500).json({ message: "통계 조회 실패" });
+    });
+});
 
-        const data = await response.json();
+// ─── 유저 상세 조회 (강의 목록 + 퀴즈 히스토리) ──────────────────────
+app.get("/api/admin/users/:userId/detail", requireAdmin, (req, res) => {
+    const { userId } = req.params;
+    const run = (sql, params = []) =>
+        new Promise((resolve, reject) =>
+            db.query(sql, params, (err, result) => (err ? reject(err) : resolve(result)))
+        );
 
-        if (!response.ok) {
-            throw new Error(data.error?.message || "GPT 응답 실패");
-        }
+    (async () => {
+        const [userRows, lectures, quizHistory] = await Promise.all([
+            run(
+                "SELECT user_id, name, email, is_verified, is_admin, created_at FROM users WHERE user_id = ?",
+                [userId]
+            ),
+            run(
+                "SELECT id, title, created_at FROM lectures WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
+                [userId]
+            ),
+            run(
+                `SELECT id, lecture_title, score, correct, total, created_at
+                 FROM quiz_history WHERE user_id = ?
+                 ORDER BY created_at DESC LIMIT 20`,
+                [userId]
+            ),
+        ]);
 
-        const answer =
-            data.choices?.[0]?.message?.content?.trim() ||
-            "답변을 생성할 수 없었습니다.";
+        if (userRows.length === 0) return res.status(404).json({ message: "유저를 찾을 수 없습니다." });
 
-        return res.status(200).json({ answer });
-    } catch (err) {
-        console.error("AI 채팅 오류:", err);
-        return res.status(500).json({
-            message: err.message || "AI 채팅 오류",
+        return res.status(200).json({
+            user: userRows[0],
+            lectures,
+            quizHistory,
         });
-    }
+    })().catch((err) => {
+        console.error("유저 상세 조회 오류:", err);
+        return res.status(500).json({ message: "유저 상세 조회 실패" });
+    });
 });
 
 server.listen(PORT, () => {
