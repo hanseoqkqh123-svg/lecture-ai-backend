@@ -2118,6 +2118,7 @@ app.post("/api/summarize", requireAuth, lectureFileUpload.array("files", 10), as
     }
     if (!Array.isArray(quizTypes)) quizTypes = ["short"];
 
+    // 파일명과 추출 텍스트를 분리해서 저장 (name, text 두 필드)
     const extractedParts = [];
 
 for (const file of req.files || []) {
@@ -2125,7 +2126,7 @@ for (const file of req.files || []) {
     const extractedText = await extractLectureFileText(file);
 
     if (String(extractedText || "").trim()) {
-        extractedParts.push(`파일명: ${originalName}\n${extractedText}`);
+        extractedParts.push({ name: originalName, text: extractedText.trim() });
     }
 
     // 요약용 임시 업로드 파일은 저장하지 않고 삭제
@@ -2134,13 +2135,13 @@ for (const file of req.files || []) {
 
     const normalizedParts = extractedParts
     .map((part, index) => {
-        const cleaned = String(part || "").trim();
+        const cleaned = String(part.text || "").trim();
 
         if (!cleaned) return "";
 
         return [
             "==============================",
-            `첨부파일 ${index + 1} 추출 내용`,
+            `첨부파일 ${index + 1} (${part.name}) 추출 내용`,
             "==============================",
             cleaned,
         ].join("\n");
@@ -2222,8 +2223,9 @@ ${content.slice(0, 24000)}
 const fileSummaries = [];
 
 for (let i = 0; i < extractedParts.length; i++) {
-    const summary = await summarizeOneFile(extractedParts[i], i);
-    fileSummaries.push(`첨부파일 ${i + 1} 요약:\n${summary}`);
+    // extractedParts[i].text 만 전달 (파일명 헤더 제외한 순수 내용)
+    const summary = await summarizeOneFile(extractedParts[i].text, i);
+    fileSummaries.push(`첨부파일 ${i + 1} (${extractedParts[i].name}) 요약:\n${summary}`);
 }
 
 const summarySourceText = [
@@ -2428,8 +2430,9 @@ try {
 
             // 디버깅/표시용 파일별 추출 정보
             extractedFiles: extractedParts.map((part) => ({
-                text: part,
-                length: part.length,
+                name: part.name,
+                text: part.text,
+                length: part.text.length,
             })),
         });
 
