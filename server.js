@@ -1364,7 +1364,7 @@ app.get("/api/chat/messages/:roomId", requireAuth, (req, res) => {
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
-// 1. 네이버 메일 전송 설정
+/* 1. 네이버 메일 전송 설정
 const naverTransporter = nodemailer.createTransport({
     host: "smtp.naver.com",
     port: 465,
@@ -1382,7 +1382,7 @@ const gmailTransporter = nodemailer.createTransport({
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_PASS
     }
-});
+}); */
 
 //1. 회원가입 api
 app.post("/api/signup", async (req, res) => {
@@ -1401,44 +1401,60 @@ app.post("/api/signup", async (req, res) => {
         const verificationToken = crypto.randomBytes(32).toString("hex");
         const verifyUrl = `${process.env.BACKEND_URL || "http://localhost:5000"}/api/verify-email?token=${verificationToken}`;
 
-        const sendVerificationMail = () => {
-            const transporter = gmailTransporter;
-
-            const mailOptions = {
-                from: `Lecture AI <${process.env.GMAIL_USER}>`,
-                to: cleanEmail,
-                subject: "[Lecture AI] 이메일 인증을 완료해주세요",
-                html: `
-                    <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
-                        <div style="max-width:500px;margin:0 auto;background:white;padding:24px;border-radius:12px;border:1px solid #eee;">
-                            <h2 style="color:#2383e2;">Lecture AI 이메일 인증</h2>
-                            <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
-                            <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 18px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;">
-                                이메일 인증하기
-                            </a>
-                            <p style="margin-top:20px;color:#666;font-size:13px;">
-                                버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
-                                ${verifyUrl}
-                            </p>
-                        </div>
+        const sendVerificationMail = async () => {
+            try {
+                const brevoRes = await fetch("https://api.brevo.com/v3/smtp/email", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "api-key": process.env.BREVO_API_KEY,
+                    },
+                    body: JSON.stringify({
+                        sender: {
+                            name: process.env.BREVO_SENDER_NAME || "Lecture AI",
+                            email: process.env.BREVO_SENDER_EMAIL,
+                        },
+                        to: [
+                            {
+                                email: cleanEmail,
+                                name: cleanName,
+                            },
+                        ],
+                        subject: "[Lecture AI] 이메일 인증",
+                        htmlContent: `
+                    <div style="padding:40px;font-family:sans-serif;">
+                        <h2>Lecture AI 이메일 인증</h2>
+                        <p>아래 버튼을 눌러 인증해주세요.</p>
+                        <a href="${verifyUrl}"
+                           style="display:inline-block;padding:12px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:8px;">
+                            이메일 인증하기
+                        </a>
+                        <p style="margin-top:20px;color:#666;font-size:13px;">
+                            버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
+                            ${verifyUrl}
+                        </p>
                     </div>
                 `,
-            };
+                    }),
+                });
 
-            transporter.sendMail(mailOptions, (mailErr) => {
-                if (mailErr) {
-                    console.error("메일 발송 실패:", mailErr);
-                    return res.status(500).json({
-                        message: "메일 발송에 실패했습니다. 백엔드 터미널의 메일 발송 실패 로그를 확인해주세요.",
-                    });
+                const resultText = await brevoRes.text();
+
+                if (!brevoRes.ok) {
+                    console.error("Brevo 메일 발송 실패:", resultText);
+                    return res.status(500).json({ message: "메일 발송 실패" });
                 }
 
                 return res.status(200).json({
-                    message: "📩 인증 메일이 발송되었습니다! 메일함을 확인해주세요.",
+                    message: "인증 메일이 발송되었습니다.",
                 });
-            });
+            } catch (error) {
+                console.error("Brevo 메일 발송 오류:", error);
+                return res.status(500).json({ message: "메일 발송 실패" });
+            }
         };
 
+        
         db.query(
             "SELECT user_id, is_verified FROM users WHERE email = ? LIMIT 1",
             [cleanEmail],
