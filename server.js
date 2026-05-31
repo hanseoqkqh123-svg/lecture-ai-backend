@@ -3,6 +3,7 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const db = require("./db");
 const http = require("http");
+const { fromPath } = require("pdf2pic"); 
 const { Server } = require("socket.io");
 const multer = require("multer");
 const fs = require("fs");
@@ -34,7 +35,17 @@ const lectureFileStorage = multer.diskStorage({
     },
 });
 
-const lectureFileUpload = multer({ storage: lectureFileStorage });
+const ALLOWED_EXTS = ['.pdf','.pptx','.docx','.txt','.md','.csv','.hwpx','.hwp','.png','.jpg','.jpeg','.gif','.webp'];
+const lectureFileUpload = multer({
+  storage: lectureFileStorage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (ALLOWED_EXTS.includes(ext)) cb(null, true);
+    else cb(new Error('허용되지 않는 파일 형식입니다.'));
+  }
+});
+
 function fixOriginalName(name) {
     if (!name) return "첨부파일";
 
@@ -125,41 +136,62 @@ async function extractLectureFileText(file) {
                 .replace(/\s+/g, " ")
                 .trim();
 
-            if (pdfText.length >= 80) {
+            // 1. 일반 PDF인 경우 (글자가 20자 이상 정상 추출되면 그대로 사용)
+            if (pdfText.length >= 20) {
                 return pdfText;
             }
 
-            return "[PDF 텍스트 추출이 충분하지 않습니다. 이 PDF는 스캔본이거나 특수 폰트 PDF일 수 있습니다. 텍스트가 선택 가능한 PDF 또는 PPTX/DOCX로 변환해 업로드하면 더 정확합니다.]";
+            // 2. 글자가 없는 스캔본(이미지) PDF인 경우 -> 이미지로 변환 후 OpenAI(Vision) API 사용
+            console.log(`스캔본 PDF 감지됨(${originalName}). 이미지 변환 후 OCR 분석을 시작합니다.`);
+            
+            const options = {
+                density: 150,
+                saveFilename: `pdf_img_${Date.now()}`,
+                savePath: "./uploads_tmp",
+                format: "png",
+                width: 1024
+            };
+            const storeAsImage = fromPath(filePath, options);
+            const pageToConvertAsImage = 1; // 우선 첫 페이지만 변환하여 분석
+            
+            const resolveData = await storeAsImage(pageToConvertAsImage);
+            const convertedImagePath = resolveData.path;
+
+            // 기존에 만들어두신 OpenAI 이미지 분석 함수 재활용
+            const ocrText = await extractImageTextWithOpenAI(convertedImagePath, "image/png");
+            
+            // 다 쓴 임시 이미지 파일은 삭제
+            if (fs.existsSync(convertedImagePath)) {
+                fs.unlinkSync(convertedImagePath);
+            }
+
+            return ocrText;
         }
 
         if (ext === ".pptx") {
             return extractZipOfficeText(filePath, [/^ppt\/slides\/slide\d+\.xml$/]);
         }
-
         if (ext === ".docx") {
             return extractZipOfficeText(filePath, [/^word\/document\.xml$/]);
         }
-
         if (ext === ".hwpx") {
             return extractZipOfficeText(filePath, [/^Contents\/section\d+\.xml$/]);
         }
-
         if ([".txt", ".md", ".csv"].includes(ext)) {
             return fs.readFileSync(filePath, "utf8");
         }
-
         if (mimetype.startsWith("image/")) {
             return await extractImageTextWithOpenAI(filePath, mimetype);
         }
-
         if (ext === ".hwp") {
-            return "[.hwp 파일은 바로 읽기 어렵습니다. 가능하면 .hwpx 또는 PDF로 변환해서 업로드해주세요.]";
+            throw new Error(".hwp 파일은 바로 읽기 어렵습니다. PDF나 이미지로 변환해서 업로드해주세요.");
         }
 
         return "";
     } catch (err) {
         console.error(`${originalName} 내용 추출 실패:`, err);
-        return "";
+        
+        throw new Error(`파일 분석 실패 (${originalName}): 스캔본이거나 손상된 파일일 수 있습니다.`);
     }
 }
 
@@ -172,8 +204,18 @@ const storage = multer.diskStorage({
         const ext = path.extname(file.originalname) || ".webm";
         cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
     },
+});	
+
+const AUDIO_EXTS = ['.webm','.ogg','.mp4','.wav','.mp3','.m4a'];
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase() || '.webm';
+    if (AUDIO_EXTS.includes(ext)) cb(null, true);
+    else cb(new Error('오디오 파일만 업로드 가능합니다.'));
+  }
 });
-const upload = multer({ storage });
 
 function convertToWav(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
@@ -249,8 +291,19 @@ function requireAuth(req, res, next) {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;
-        next();
+
+        db.query(
+            "SELECT is_banned FROM users WHERE user_id = ? LIMIT 1",
+            [decoded.user_id],
+            (err, rows) => {
+                if (err) return res.status(500).json({ message: "서버 오류" });
+                if (rows.length === 0) return res.status(401).json({ message: "존재하지 않는 유저입니다." });
+                if (rows[0].is_banned) return res.status(403).json({ message: "🚫 정지된 계정입니다. 관리자에게 문의하세요." });
+
+                req.user = decoded;
+                next();
+            }
+        );
     } catch {
         return res.status(401).json({ message: "토큰 오류" });
     }
@@ -263,9 +316,20 @@ function requireAdmin(req, res, next) {
     if (!token) return res.status(401).json({ message: "인증 필요" });
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        if (!decoded.is_admin) return res.status(403).json({ message: "관리자 권한이 필요합니다." });
-        req.user = decoded;
-        next();
+
+        db.query(
+            "SELECT is_banned, is_admin FROM users WHERE user_id = ? LIMIT 1",
+            [decoded.user_id],
+            (err, rows) => {
+                if (err) return res.status(500).json({ message: "서버 오류" });
+                if (rows.length === 0) return res.status(401).json({ message: "존재하지 않는 유저입니다." });
+                if (rows[0].is_banned) return res.status(403).json({ message: "🚫 정지된 계정입니다." });
+                if (!rows[0].is_admin) return res.status(403).json({ message: "관리자 권한이 필요합니다." });
+
+                req.user = decoded;
+                next();
+            }
+        );
     } catch {
         return res.status(401).json({ message: "토큰 오류" });
     }
@@ -386,7 +450,10 @@ io.on("connection", (socket) => {
         const text = String(data.text || "").trim();
         const client_temp_id = data.client_temp_id || null;
 
-        if (!roomId || !text) return;
+       		if (!roomId || !text) return;
+		if (text.length > 2000) {
+   		 return socket.emit('error', { message: '메시지는 2000자 이하여야 합니다.' });
+		}
 
         const saveMessage = () => {
             const sql =
@@ -523,52 +590,6 @@ io.on("connection", (socket) => {
 
 app.get("/", (req, res) => {
     res.send("🚀 캡스톤 9조 백엔드 서버가 성공적으로 켜졌습니다!");
-});
-
-app.post("/api/ai-chat", requireAuth, async (req, res) => {
-    try {
-        const { messages, lectureContext } = req.body;
-
-        const systemPrompt = lectureContext
-            ? `너는 강의 내용을 바탕으로 답변하는 한국어 AI 튜터야.
-
-아래 강의 내용을 참고해서 사용자의 질문에 답변해.
-
-${lectureContext}`
-            : "너는 친절한 한국어 AI 튜터야. 사용자의 질문에 쉽고 정확하게 답변해.";
-
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            },
-            body: JSON.stringify({
-                model: "gpt-4o-mini",
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    ...(Array.isArray(messages) ? messages : []),
-                ],
-            }),
-        });
-
-        const data = await response.json();
-
-        if (!response.ok) {
-            return res.status(response.status).json({
-                message: data.error?.message || "AI 응답 생성 실패",
-            });
-        }
-
-        return res.status(200).json({
-            answer: data.choices?.[0]?.message?.content || "답변을 생성하지 못했습니다.",
-        });
-    } catch (err) {
-        console.error("AI 질문 오류:", err);
-        return res.status(500).json({
-            message: err.message || "AI 질문 처리 중 오류가 발생했습니다.",
-        });
-    }
 });
 
 // 친구 검색 및 요청
@@ -718,16 +739,27 @@ app.delete("/api/chat/rooms/leave", requireAuth, (req, res) => {
                 return res.status(404).json({ message: "해당 방의 멤버가 아니거나 방을 찾을 수 없습니다." });
             }
 
-            // 2. 방에 남은 멤버가 있는지 확인 (선택 사항: 멤버가 0명이면 방 자체를 삭제 가능)
+            // 2. 방에 남은 멤버가 있는지 확인 (0명이면 방 자체 삭제)
             db.query("SELECT COUNT(*) as count FROM room_members WHERE room_id = ?", [roomId], (countErr, countRows) => {
-                if (!countErr && countRows[0].count === 0) {
-                    // 메시지와 방 정보 삭제
-                    db.query("DELETE FROM chat_messages WHERE room_id = ?", [roomId]);
-                    db.query("DELETE FROM chat_rooms WHERE room_id = ?", [roomId]);
+                if (countErr) {
+                    console.error("잔여 멤버 확인 실패:", countErr);
+                    // 멤버 수 확인 실패는 치명적이지 않으므로 나가기 성공으로 응답
+                    return res.status(200).json({ message: "채팅방에서 성공적으로 나갔습니다." });
                 }
-            });
 
-            return res.status(200).json({ message: "채팅방에서 성공적으로 나갔습니다." });
+                if (countRows[0].count === 0) {
+                    // 메시지 먼저 삭제 후 방 삭제 (순서 보장)
+                    db.query("DELETE FROM chat_messages WHERE room_id = ?", [roomId], (msgErr) => {
+                        if (msgErr) console.error("빈 방 메시지 삭제 실패:", msgErr);
+
+                        db.query("DELETE FROM chat_rooms WHERE room_id = ?", [roomId], (roomErr) => {
+                            if (roomErr) console.error("빈 방 삭제 실패:", roomErr);
+                        });
+                    });
+                }
+
+                return res.status(200).json({ message: "채팅방에서 성공적으로 나갔습니다." });
+            });
         }
     );
 });
@@ -1102,148 +1134,6 @@ app.delete("/api/friends/:friendId", requireAuth, (req, res) => {
     );
 });
 
-
-function emitBoardToFriendsAndSelf(ownerId, eventName, payload) {
-    io.to(`user_${ownerId}`).emit(eventName, payload);
-
-    db.query(
-        `
-        SELECT CASE
-            WHEN user_id = ? THEN friend_id
-            ELSE user_id
-        END AS friend_id
-        FROM friends
-        WHERE (user_id = ? OR friend_id = ?)
-          AND status = 'accepted'
-        `,
-        [ownerId, ownerId, ownerId],
-        (err, rows) => {
-            if (err) {
-                console.error("보드 친구 조회 실패:", err);
-                return;
-            }
-
-            rows.forEach((row) => {
-                io.to(`user_${row.friend_id}`).emit(eventName, payload);
-            });
-        }
-    );
-}
-
-app.get("/api/board/items", requireAuth, (req, res) => {
-    const userId = req.user.user_id;
-
-    const sql = `
-        SELECT bi.*
-        FROM board_items bi
-        WHERE bi.owner_id = ?
-           OR bi.owner_id IN (
-                SELECT CASE
-                    WHEN user_id = ? THEN friend_id
-                    ELSE user_id
-                END
-                FROM friends
-                WHERE (user_id = ? OR friend_id = ?)
-                  AND status = 'accepted'
-           )
-        ORDER BY bi.created_at ASC
-    `;
-
-    db.query(sql, [userId, userId, userId, userId], (err, rows) => {
-        if (err) {
-            console.error("보드 목록 조회 실패:", err);
-            return res.status(500).json({ message: "보드 목록 조회 실패" });
-        }
-
-        const items = rows.map((row) => ({
-            id: row.id,
-            owner_id: row.owner_id,
-            item_type: row.item_type,
-            data: typeof row.data === "string" ? JSON.parse(row.data) : row.data,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }));
-
-        res.json(items);
-    });
-});
-
-app.post("/api/board/items", requireAuth, (req, res) => {
-    const ownerId = req.user.user_id;
-    const { id, item_type, data } = req.body;
-
-    if (!id || !item_type || !data) {
-        return res.status(400).json({ message: "보드 데이터가 부족합니다." });
-    }
-
-    const sql = `
-        INSERT INTO board_items (id, owner_id, item_type, data)
-        VALUES (?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE data = VALUES(data)
-    `;
-
-    db.query(sql, [id, ownerId, item_type, JSON.stringify(data)], (err) => {
-        if (err) {
-            console.error("보드 저장 실패:", err);
-            return res.status(500).json({ message: "보드 저장 실패" });
-        }
-
-        const payload = { id, owner_id: ownerId, item_type, data };
-        emitBoardToFriendsAndSelf(ownerId, "board_item_saved", payload);
-
-        res.json(payload);
-    });
-});
-
-app.delete("/api/board/items", requireAuth, (req, res) => {
-    const ownerId = req.user.user_id;
-
-    db.query(
-        "DELETE FROM board_items WHERE owner_id = ?",
-        [ownerId],
-        (err) => {
-            if (err) {
-                console.error("보드 전체 삭제 실패:", err);
-                return res.status(500).json({ message: "보드 전체 삭제 실패" });
-            }
-
-            emitBoardToFriendsAndSelf(ownerId, "board_cleared", {
-                owner_id: ownerId,
-            });
-
-            res.json({ message: "보드 전체 삭제 완료" });
-        }
-    );
-});
-
-app.delete("/api/board/items/:id", requireAuth, (req, res) => {
-    const ownerId = req.user.user_id;
-    const itemId = req.params.id;
-
-    db.query(
-        "DELETE FROM board_items WHERE id = ? AND owner_id = ?",
-        [itemId, ownerId],
-        (err, result) => {
-            if (err) {
-                console.error("보드 삭제 실패:", err);
-                return res.status(500).json({ message: "보드 삭제 실패" });
-            }
-
-            if (result.affectedRows === 0) {
-                return res.status(403).json({ message: "삭제 권한이 없습니다." });
-            }
-
-            emitBoardToFriendsAndSelf(ownerId, "board_item_deleted", {
-                id: itemId,
-                owner_id: ownerId,
-            });
-
-            res.json({ message: "삭제되었습니다." });
-        }
-    );
-});
-
-
 // 단체 채팅방 생성 API (Internal Server Error 방지 버전)
 app.post("/api/chat/rooms", requireAuth, (req, res) => {
     const creatorId = req.user.user_id;
@@ -1364,25 +1254,6 @@ app.get("/api/chat/messages/:roomId", requireAuth, (req, res) => {
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
-/* 1. 네이버 메일 전송 설정
-const naverTransporter = nodemailer.createTransport({
-    host: "smtp.naver.com",
-    port: 465,
-    secure: true, // SSL 사용
-    auth: {
-        user: process.env.NAVER_USER, // 네이버 아이디 (예: abc@naver.com)
-        pass: process.env.NAVER_PASS  // 네이버 앱 비밀번호
-    }
-});
-
-// 2. 지메일 설정
-const gmailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_PASS
-    }
-}); */
 
 //1. 회원가입 api
 app.post("/api/signup", async (req, res) => {
@@ -1393,68 +1264,65 @@ app.post("/api/signup", async (req, res) => {
     const cleanPassword = String(password || "");
 
     if (!cleanName || !cleanEmail || !cleanPassword) {
-        return res.status(400).json({ message: "이름, 이메일, 비밀번호를 입력해주세요." });
-    }
+    return res.status(400).json({ message: "이름, 이메일, 비밀번호를 입력해주세요." });
+}
+
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+if (!emailRegex.test(cleanEmail)) {
+    return res.status(400).json({ message: "유효한 이메일 형식이 아닙니다." });
+}
+
+if (cleanPassword.length < 8) {
+    return res.status(400).json({ message: "비밀번호는 8자 이상이어야 합니다." });
+}
+
+if (cleanName.length > 50) {
+    return res.status(400).json({ message: "이름은 50자 이하여야 합니다." });
+}
 
     try {
         const hashedPassword = await bcrypt.hash(cleanPassword, 10);
         const verificationToken = crypto.randomBytes(32).toString("hex");
         const verifyUrl = `${process.env.BACKEND_URL || "http://localhost:5000"}/api/verify-email?token=${verificationToken}`;
 
-        const sendVerificationMail = async () => {
-            try {
-                const brevoRes = await fetch("https://api.brevo.com/v3/smtp/email", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "api-key": process.env.BREVO_API_KEY,
-                    },
-                    body: JSON.stringify({
-                        sender: {
-                            name: process.env.BREVO_SENDER_NAME || "Lecture AI",
-                            email: process.env.BREVO_SENDER_EMAIL,
-                        },
-                        to: [
-                            {
-                                email: cleanEmail,
-                                name: cleanName,
-                            },
-                        ],
-                        subject: "[Lecture AI] 이메일 인증",
-                        htmlContent: `
-                    <div style="padding:40px;font-family:sans-serif;">
-                        <h2>Lecture AI 이메일 인증</h2>
-                        <p>아래 버튼을 눌러 인증해주세요.</p>
-                        <a href="${verifyUrl}"
-                           style="display:inline-block;padding:12px 20px;background:#2563eb;color:white;text-decoration:none;border-radius:8px;">
-                            이메일 인증하기
-                        </a>
-                        <p style="margin-top:20px;color:#666;font-size:13px;">
-                            버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
-                            ${verifyUrl}
-                        </p>
+        const sendVerificationMail = () => {
+            const transporter = gmailTransporter;
+
+            const mailOptions = {
+                from: `Lecture AI <${process.env.GMAIL_USER}>`,
+                to: cleanEmail,
+                subject: "[Lecture AI] 이메일 인증을 완료해주세요",
+                html: `
+                    <div style="background:#f9fafb;padding:40px;font-family:sans-serif;">
+                        <div style="max-width:500px;margin:0 auto;background:white;padding:24px;border-radius:12px;border:1px solid #eee;">
+                            <h2 style="color:#2383e2;">Lecture AI 이메일 인증</h2>
+                            <p>아래 버튼을 눌러 이메일 인증을 완료해주세요.</p>
+                            <a href="${verifyUrl}" style="display:inline-block;margin-top:16px;padding:12px 18px;background:#2383e2;color:white;text-decoration:none;border-radius:8px;">
+                                이메일 인증하기
+                            </a>
+                            <p style="margin-top:20px;color:#666;font-size:13px;">
+                                버튼이 안 눌리면 아래 링크를 복사해서 브라우저에 붙여넣어 주세요.<br/>
+                                ${verifyUrl}
+                            </p>
+                        </div>
                     </div>
                 `,
-                    }),
-                });
+            };
 
-                const resultText = await brevoRes.text();
-
-                if (!brevoRes.ok) {
-                    console.error("Brevo 메일 발송 실패:", resultText);
-                    return res.status(500).json({ message: "메일 발송 실패" });
+            transporter.sendMail(mailOptions, (mailErr) => {
+                if (mailErr) {
+                    console.error("메일 발송 실패:", mailErr);
+                    return res.status(500).json({
+                        message: "메일 발송에 실패했습니다. 백엔드 터미널의 메일 발송 실패 로그를 확인해주세요.",
+                    });
                 }
 
                 return res.status(200).json({
-                    message: "인증 메일이 발송되었습니다.",
+                    message: "📩 인증 메일이 발송되었습니다! 메일함을 확인해주세요.",
                 });
-            } catch (error) {
-                console.error("Brevo 메일 발송 오류:", error);
-                return res.status(500).json({ message: "메일 발송 실패" });
-            }
+            });
         };
 
-        
         db.query(
             "SELECT user_id, is_verified FROM users WHERE email = ? LIMIT 1",
             [cleanEmail],
@@ -1546,6 +1414,10 @@ app.post("/api/login", (req, res) => {
         // 핵심: 인증 여부를 먼저 확인하고 에러 메시지를 다르게 보냄
         if (!user.is_verified) {
             return res.status(403).json({ message: "❌ 이메일 인증이 완료되지 않았습니다. 메일함을 확인해주세요!" });
+        }
+
+        if (user.is_banned) {
+            return res.status(403).json({ message: "🚫 정지된 계정입니다. 관리자에게 문의하세요." });
         }
 
         const isMatch = await bcrypt.compare(password, user.password);
@@ -2134,44 +2006,28 @@ app.post("/api/summarize", requireAuth, lectureFileUpload.array("files", 10), as
     }
     if (!Array.isArray(quizTypes)) quizTypes = ["short"];
 
-    // 파일명과 추출 텍스트를 분리해서 저장 (name, text 두 필드)
     const extractedParts = [];
 
-for (const file of req.files || []) {
-    const originalName = fixOriginalName(file.originalname);
-    const extractedText = await extractLectureFileText(file);
+    for (const file of req.files || []) {
+        const originalName = fixOriginalName(file.originalname);
+        const extractedText = await extractLectureFileText(file);
 
-    if (String(extractedText || "").trim()) {
-        extractedParts.push({ name: originalName, text: extractedText.trim() });
+        if (String(extractedText || "").trim()) {
+            extractedParts.push(`파일명: ${originalName}\n${extractedText}`);
+        }
+
+        // 요약용 임시 업로드 파일은 저장하지 않고 삭제
+        fs.unlink(file.path, () => { });
     }
 
-    // 요약용 임시 업로드 파일은 저장하지 않고 삭제
-    fs.unlink(file.path, () => { });
-}
-
-    const normalizedParts = extractedParts
-    .map((part, index) => {
-        const cleaned = String(part.text || "").trim();
-
-        if (!cleaned) return "";
-
-        return [
-            "==============================",
-            `첨부파일 ${index + 1} (${part.name}) 추출 내용`,
-            "==============================",
-            cleaned,
-        ].join("\n");
-    })
-    .filter(Boolean);
-
-const combinedText = [
-    String(text || "").trim()
-        ? `사용자 입력 내용:\n${String(text || "").trim()}`
-        : "",
-    ...normalizedParts,
-]
-    .filter(Boolean)
-    .join("\n\n");
+    const combinedText = [
+        String(text || "").trim() ? `사용자 입력 내용:\n${String(text || "").trim()}` : "",
+        extractedParts.length > 0
+            ? `첨부파일에서 추출한 내용:\n${extractedParts.join("\n\n")}`
+            : "",
+    ]
+        .filter(Boolean)
+        .join("\n\n");
 
     if (!combinedText.trim()) {
         return res.status(400).json({ message: "요약할 텍스트나 파일 내용이 없습니다." });
@@ -2201,59 +2057,6 @@ const combinedText = [
     } else {
         typeInstruction = `문제 유형을 아래 유형들 사이에서 골고루 섞어라: ${quizTypes.map(t => ({ short: "단답형", mcq: "객관식", ox: "OX" }[t])).join(", ")}.`;
     }
-
-    const summarizeOneFile = async (content, index) => {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify({
-            model: "gpt-4o-mini",
-            messages: [
-                {
-                    role: "user",
-                    content: `
-다음은 첨부파일 ${index + 1}의 강의 원문이다.
-중요 개념, 코드, 키워드, 시험 포인트가 빠지지 않게 한국어로 자세히 요약해라.
-
-강의 원문:
-${content.slice(0, 24000)}
-`,
-                },
-            ],
-            temperature: 0,
-        }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-        throw new Error(data.error?.message || `첨부파일 ${index + 1} 요약 실패`);
-    }
-
-    return data.choices?.[0]?.message?.content || "";
-};
-
-const fileSummaries = [];
-
-for (let i = 0; i < extractedParts.length; i++) {
-    // extractedParts[i].text 만 전달 (파일명 헤더 제외한 순수 내용)
-    const summary = await summarizeOneFile(extractedParts[i].text, i);
-    fileSummaries.push(`첨부파일 ${i + 1} (${extractedParts[i].name}) 요약:\n${summary}`);
-}
-
-const summarySourceText = [
-    String(text || "").trim()
-        ? `사용자 입력 내용:\n${String(text || "").trim()}`
-        : "",
-    fileSummaries.length > 0
-        ? `첨부파일별 요약:\n${fileSummaries.join("\n\n")}`
-        : "",
-]
-    .filter(Boolean)
-    .join("\n\n");
 
     try {
         const prompt = `
@@ -2391,7 +2194,7 @@ quiz 배열 규칙:
 - 강의 맥락 기반 설명
 
 강의 내용:
-${summarySourceText}
+${combinedText.slice(0, 24000)}
 `;
 
         const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -2424,32 +2227,11 @@ ${summarySourceText}
             throw new Error("JSON 파싱 실패");
         }
 
-        let parsed;
-
-try {
-    parsed = JSON.parse(match[0]);
-} catch (parseErr) {
-    console.error("JSON 파싱 실패 원문:", raw);
-
-    const repairedJson = match[0]
-        .replace(/\r?\n/g, "\\n")
-        .replace(/\t/g, "\\t");
-
-    parsed = JSON.parse(repairedJson);
-}
+        const parsed = JSON.parse(match[0]);
 
         return res.status(200).json({
             ...parsed,
-
-            // 프론트 화면/저장용 원문은 자르지 않고 전체 반환
-            extractedText: combinedText,
-
-            // 디버깅/표시용 파일별 추출 정보
-            extractedFiles: extractedParts.map((part) => ({
-                name: part.name,
-                text: part.text,
-                length: part.text.length,
-            })),
+            extractedText: extractedParts.join("\n\n").slice(0, 12000),  // 파일 추출분만
         });
 
     } catch (err) {
@@ -2490,8 +2272,6 @@ app.post("/api/translate-summarize", requireAuth, async (req, res) => {
 다음 강의 내용을 분석해서 반드시 JSON 형식으로만 응답해.
 
 설명 문장 절대 쓰지 말고 JSON만 반환해.
-JSON 문자열 안에는 실제 줄바꿈을 넣지 말고 반드시 \\n으로 이스케이프해라.
-summary, keywordExplanations, studyGuide의 모든 문자열은 한 줄 문자열로 작성해라.
 
 중요:
 - keywords 배열에는 실제 핵심 키워드만 넣어라.
@@ -2648,7 +2428,7 @@ ${text.slice(0, 8000)}
 // ─── 전체 유저 목록 조회 ────────────────────────────────────────────
 app.get("/api/admin/users", requireAdmin, (req, res) => {
     db.query(
-        "SELECT user_id, name, email, is_verified, is_admin, created_at FROM users ORDER BY created_at DESC",
+        "SELECT user_id, name, email, is_verified, is_admin, is_banned, created_at FROM users ORDER BY created_at DESC",
         (err, results) => {
             if (err) return res.status(500).json({ message: "유저 목록 조회 실패" });
             return res.status(200).json(results);
@@ -2711,6 +2491,38 @@ app.patch("/api/admin/users/:userId/toggle-admin", requireAdmin, (req, res) => {
         db.query("UPDATE users SET is_admin = ? WHERE user_id = ?", [newVal, targetId], (err2) => {
             if (err2) return res.status(500).json({ message: "권한 변경 실패" });
             return res.status(200).json({ message: `관리자 권한 ${newVal ? "부여" : "해제"} 완료`, is_admin: newVal });
+        });
+    });
+});
+
+// ─── 강제 인증 토글 ──────────────────────────────────────────────
+app.patch("/api/admin/users/:userId/toggle-verify", requireAdmin, (req, res) => {
+    const targetId = req.params.userId;
+    db.query("SELECT is_verified FROM users WHERE user_id = ?", [targetId], (err, rows) => {
+        if (err) return res.status(500).json({ message: "DB 오류" });
+        if (rows.length === 0) return res.status(404).json({ message: "유저를 찾을 수 없습니다." });
+        const newVal = rows[0].is_verified ? 0 : 1;
+        db.query("UPDATE users SET is_verified = ? WHERE user_id = ?", [newVal, targetId], (err2) => {
+            if (err2) return res.status(500).json({ message: "변경 실패" });
+            return res.status(200).json({ message: `${newVal ? "인증 완료" : "인증 해제"} 처리됨`, is_verified: newVal });
+        });
+    });
+});
+
+// ─── 계정 정지 토글 ──────────────────────────────────────────────
+app.patch("/api/admin/users/:userId/toggle-ban", requireAdmin, (req, res) => {
+    const targetId = req.params.userId;
+    if (String(targetId) === String(req.user.user_id)) {
+        return res.status(400).json({ message: "본인 계정은 정지할 수 없습니다." });
+    }
+    db.query("SELECT is_banned, is_admin FROM users WHERE user_id = ?", [targetId], (err, rows) => {
+        if (err) return res.status(500).json({ message: "DB 오류" });
+        if (rows.length === 0) return res.status(404).json({ message: "유저를 찾을 수 없습니다." });
+        if (rows[0].is_admin) return res.status(400).json({ message: "관리자 계정은 정지할 수 없습니다." });
+        const newVal = rows[0].is_banned ? 0 : 1;
+        db.query("UPDATE users SET is_banned = ? WHERE user_id = ?", [newVal, targetId], (err2) => {
+            if (err2) return res.status(500).json({ message: "변경 실패" });
+            return res.status(200).json({ message: `${newVal ? "계정 정지" : "정지 해제"} 처리됨`, is_banned: newVal });
         });
     });
 });
@@ -2787,6 +2599,8 @@ app.get("/api/admin/stats", requireAdmin, (req, res) => {
             dailyUsers,
             dailyLectures,
             topQuizzers,
+            bannedCount,
+            scoreDist,
         ] = await Promise.all([
             run("SELECT COUNT(*) AS cnt FROM users"),
             run("SELECT COUNT(*) AS cnt FROM users WHERE is_verified = 1"),
@@ -2808,6 +2622,9 @@ app.get("/api/admin/stats", requireAdmin, (req, res) => {
                  JOIN users u ON qh.user_id = u.user_id
                  GROUP BY qh.user_id, u.name, u.email
                  ORDER BY (COUNT(*) * SUM(qh.total)) DESC LIMIT 5`),
+            run("SELECT COUNT(*) AS cnt FROM users WHERE is_banned = 1"),
+            run(`SELECT FLOOR(score/10)*10 AS bucket, COUNT(*) AS cnt
+                 FROM quiz_history GROUP BY bucket ORDER BY bucket ASC`),
         ]);
 
         return res.status(200).json({
@@ -2818,9 +2635,11 @@ app.get("/api/admin/stats", requireAdmin, (req, res) => {
             avgScore: avgScore[0].avg ?? 0,
             newUsersWeek: newUsersWeek[0].cnt,
             newLecturesWeek: newLecturesWeek[0].cnt,
+            bannedCount: bannedCount[0].cnt,
             dailyUsers,
             dailyLectures,
             topQuizzers,
+            scoreDist,
         });
     })().catch((err) => {
         console.error("통계 조회 오류:", err);
@@ -2839,7 +2658,7 @@ app.get("/api/admin/users/:userId/detail", requireAdmin, (req, res) => {
     (async () => {
         const [userRows, lectures, quizHistory] = await Promise.all([
             run(
-                "SELECT user_id, name, email, is_verified, is_admin, created_at FROM users WHERE user_id = ?",
+                "SELECT user_id, name, email, is_verified, is_admin, is_banned, created_at FROM users WHERE user_id = ?",
                 [userId]
             ),
             run(
@@ -2865,6 +2684,48 @@ app.get("/api/admin/users/:userId/detail", requireAdmin, (req, res) => {
         console.error("유저 상세 조회 오류:", err);
         return res.status(500).json({ message: "유저 상세 조회 실패" });
     });
+});
+
+// ─── AI 채팅 (강의 컨텍스트 기반 튜터) ──────────────────────────────
+app.post("/api/ai-chat", requireAuth, async (req, res) => {
+    const { messages, lectureContext } = req.body;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({ message: "메시지가 없습니다." });
+    }
+
+    const systemPrompt = lectureContext
+        ? `너는 강의 내용을 바탕으로 학생의 질문에 친절하게 답해주는 AI 튜터야.\n답변은 항상 한국어로 해줘.\n\n[강의 정보]\n${lectureContext}`
+        : "너는 학습을 도와주는 AI 튜터야. 질문에 친절하고 명확하게 한국어로 답해줘.";
+
+    try {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    ...messages,
+                ],
+            }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error?.message || "GPT 요청 실패");
+        }
+
+        const answer = data.choices?.[0]?.message?.content || "";
+        return res.status(200).json({ answer });
+    } catch (err) {
+        console.error("AI 채팅 오류:", err);
+        return res.status(500).json({ message: err.message || "AI 채팅 오류" });
+    }
 });
 
 server.listen(PORT, () => {
