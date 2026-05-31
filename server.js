@@ -135,40 +135,41 @@ async function extractLectureFileText(file) {
                 .replace(/\s+/g, " ")
                 .trim();
 
-            // 텍스트가 정상적으로 추출된 경우 (기준치를 20자로 낮춤)
-            if (pdfText.length >= 20) {
+            if (pdfText.length >= 80) {
                 return pdfText;
             }
 
-            // 스캔본 PDF인 경우 무한 로딩이나 서버 에러를 막고 명확한 안내를 띄움
-            throw new Error("PDF에서 텍스트를 찾을 수 없습니다. 스캔본(이미지) PDF인 경우 화면/인강 캡처 기능을 사용하거나, 이미지를 직접 업로드해주세요.");
+            return "[PDF 텍스트 추출이 충분하지 않습니다. 이 PDF는 스캔본이거나 특수 폰트 PDF일 수 있습니다. 텍스트가 선택 가능한 PDF 또는 PPTX/DOCX로 변환해 업로드하면 더 정확합니다.]";
         }
 
-        // 기존 코딩해두신 PPT, DOCX, TXT, 이미지 처리 로직은 그대로 유지
         if (ext === ".pptx") {
             return extractZipOfficeText(filePath, [/^ppt\/slides\/slide\d+\.xml$/]);
         }
+
         if (ext === ".docx") {
             return extractZipOfficeText(filePath, [/^word\/document\.xml$/]);
         }
+
         if (ext === ".hwpx") {
             return extractZipOfficeText(filePath, [/^Contents\/section\d+\.xml$/]);
         }
+
         if ([".txt", ".md", ".csv"].includes(ext)) {
             return fs.readFileSync(filePath, "utf8");
         }
+
         if (mimetype.startsWith("image/")) {
             return await extractImageTextWithOpenAI(filePath, mimetype);
         }
+
         if (ext === ".hwp") {
-            throw new Error(".hwp 파일은 바로 읽기 어렵습니다. PDF나 이미지로 변환해서 업로드해주세요.");
+            return "[.hwp 파일은 바로 읽기 어렵습니다. 가능하면 .hwpx 또는 PDF로 변환해서 업로드해주세요.]";
         }
 
         return "";
     } catch (err) {
         console.error(`${originalName} 내용 추출 실패:`, err);
-        // 사용자에게 보여질 에러 메시지를 명확하게 던짐
-        throw new Error(`파일 분석 실패 (${originalName}): ${err.message || "스캔본이거나 텍스트를 추출할 수 없는 파일입니다."}`);
+        return "";
     }
 }
 
