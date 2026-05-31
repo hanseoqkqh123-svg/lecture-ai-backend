@@ -3,7 +3,6 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const db = require("./db");
 const http = require("http");
-const { fromPath } = require("pdf2pic"); 
 const { Server } = require("socket.io");
 const multer = require("multer");
 const fs = require("fs");
@@ -136,38 +135,16 @@ async function extractLectureFileText(file) {
                 .replace(/\s+/g, " ")
                 .trim();
 
-            // 1. 일반 PDF인 경우 (글자가 20자 이상 정상 추출되면 그대로 사용)
+            // 텍스트가 정상적으로 추출된 경우 (기준치를 20자로 낮춤)
             if (pdfText.length >= 20) {
                 return pdfText;
             }
 
-            // 2. 글자가 없는 스캔본(이미지) PDF인 경우 -> 이미지로 변환 후 OpenAI(Vision) API 사용
-            console.log(`스캔본 PDF 감지됨(${originalName}). 이미지 변환 후 OCR 분석을 시작합니다.`);
-            
-            const options = {
-                density: 150,
-                saveFilename: `pdf_img_${Date.now()}`,
-                savePath: "./uploads_tmp",
-                format: "png",
-                width: 1024
-            };
-            const storeAsImage = fromPath(filePath, options);
-            const pageToConvertAsImage = 1; // 우선 첫 페이지만 변환하여 분석
-            
-            const resolveData = await storeAsImage(pageToConvertAsImage);
-            const convertedImagePath = resolveData.path;
-
-            // 기존에 만들어두신 OpenAI 이미지 분석 함수 재활용
-            const ocrText = await extractImageTextWithOpenAI(convertedImagePath, "image/png");
-            
-            // 다 쓴 임시 이미지 파일은 삭제
-            if (fs.existsSync(convertedImagePath)) {
-                fs.unlinkSync(convertedImagePath);
-            }
-
-            return ocrText;
+            // 스캔본 PDF인 경우 무한 로딩이나 서버 에러를 막고 명확한 안내를 띄움
+            throw new Error("PDF에서 텍스트를 찾을 수 없습니다. 스캔본(이미지) PDF인 경우 화면/인강 캡처 기능을 사용하거나, 이미지를 직접 업로드해주세요.");
         }
 
+        // 기존 코딩해두신 PPT, DOCX, TXT, 이미지 처리 로직은 그대로 유지
         if (ext === ".pptx") {
             return extractZipOfficeText(filePath, [/^ppt\/slides\/slide\d+\.xml$/]);
         }
@@ -190,8 +167,8 @@ async function extractLectureFileText(file) {
         return "";
     } catch (err) {
         console.error(`${originalName} 내용 추출 실패:`, err);
-        
-        throw new Error(`파일 분석 실패 (${originalName}): 스캔본이거나 손상된 파일일 수 있습니다.`);
+        // 사용자에게 보여질 에러 메시지를 명확하게 던짐
+        throw new Error(`파일 분석 실패 (${originalName}): ${err.message || "스캔본이거나 텍스트를 추출할 수 없는 파일입니다."}`);
     }
 }
 
