@@ -249,6 +249,7 @@ app.use("/lecture_uploads", express.static("lecture_uploads"));
 const allowedOrigins = [
     "http://localhost:3000",
     process.env.FRONTEND_URL,
+    "https://lecture-ai-ujen.vercel.app"
 ].filter(Boolean);
 
 function createToken(user) {
@@ -2726,7 +2727,7 @@ app.get("/api/board/items", requireAuth, (req, res) => {
       id: row.id,
       owner_id: row.owner_id,
       item_type: row.item_type,
-      data: JSON.parse(row.data),
+      data: typeof row.data === "string" ? JSON.parse(row.data) : row.data,
     }));
     return res.status(200).json(result);
   });
