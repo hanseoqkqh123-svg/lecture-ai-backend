@@ -2706,6 +2706,73 @@ app.post("/api/ai-chat", requireAuth, async (req, res) => {
     }
 });
 
+// ─── 공동 보드 items 테이블 생성 (최초 1회) ─────────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS board_items (
+    id VARCHAR(100) PRIMARY KEY,
+    owner_id INT NOT NULL,
+    item_type VARCHAR(20) NOT NULL,
+    data LONGTEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )
+`);
+
+// ─── 보드 아이템 전체 조회 ────────────────────────────────────────────
+app.get("/api/board/items", requireAuth, (req, res) => {
+  db.query("SELECT id, owner_id, item_type, data FROM board_items", (err, rows) => {
+    if (err) return res.status(500).json({ message: "보드 조회 실패" });
+    const result = rows.map(row => ({
+      id: row.id,
+      owner_id: row.owner_id,
+      item_type: row.item_type,
+      data: JSON.parse(row.data),
+    }));
+    return res.status(200).json(result);
+  });
+});
+
+// ─── 보드 아이템 저장/수정 ────────────────────────────────────────────
+app.post("/api/board/items", requireAuth, (req, res) => {
+  const { id, item_type, data } = req.body;
+  const owner_id = req.user.user_id;
+  if (!id || !item_type || !data) return res.status(400).json({ message: "필수 값 누락" });
+
+  const dataStr = JSON.stringify(data);
+  db.query(
+    `INSERT INTO board_items (id, owner_id, item_type, data)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE data = VALUES(data), updated_at = NOW()`,
+    [id, owner_id, item_type, dataStr],
+    (err) => {
+      if (err) return res.status(500).json({ message: "보드 저장 실패" });
+
+      // 소켓으로 다른 사용자에게 실시간 전파
+      io.emit("board_item_saved", { id, owner_id, item_type, data });
+      return res.status(200).json({ message: "저장 완료" });
+    }
+  );
+});
+
+// ─── 보드 아이템 삭제 ────────────────────────────────────────────────
+app.delete("/api/board/items/:id", requireAuth, (req, res) => {
+  const { id } = req.params;
+  db.query("DELETE FROM board_items WHERE id = ?", [id], (err) => {
+    if (err) return res.status(500).json({ message: "보드 삭제 실패" });
+    io.emit("board_item_deleted", { id });
+    return res.status(200).json({ message: "삭제 완료" });
+  });
+});
+
+// ─── 보드 전체 초기화 ────────────────────────────────────────────────
+app.delete("/api/board/items", requireAuth, (req, res) => {
+  db.query("DELETE FROM board_items", (err) => {
+    if (err) return res.status(500).json({ message: "전체 삭제 실패" });
+    io.emit("board_cleared");
+    return res.status(200).json({ message: "전체 삭제 완료" });
+  });
+});
+
 server.listen(PORT, () => {
     console.log(`✅ 서버 실행 중: ${PORT}`);
 });
